@@ -26,7 +26,7 @@ use crate::{
     },
 };
 use cosmic_comp_config::{
-    AppearanceConfig, TileBehavior, ZoomConfig, ZoomMovement,
+    AppearanceConfig, TileBehavior, TilingEngine, ZoomConfig, ZoomMovement,
     workspace::{PinnedWorkspace, WorkspaceLayout, WorkspaceMode},
 };
 use cosmic_config::ConfigSet;
@@ -388,6 +388,7 @@ pub struct WorkspaceSet {
     pub active: usize,
     pub group: WorkspaceGroupHandle,
     tiling_enabled: bool,
+    tiling_engine: TilingEngine,
     output: Output,
     theme: cosmic::Theme,
     appearance: AppearanceConfig,
@@ -402,6 +403,7 @@ fn create_workspace(
     group_handle: &WorkspaceGroupHandle,
     active: bool,
     tiling: bool,
+    tiling_engine: TilingEngine,
     theme: cosmic::Theme,
     appearance: AppearanceConfig,
 ) -> Workspace {
@@ -431,6 +433,7 @@ fn create_workspace(
         workspace_handle,
         output.clone(),
         tiling,
+        tiling_engine,
         theme.clone(),
         appearance,
     )
@@ -442,13 +445,15 @@ fn create_workspace_from_pinned(
     output: &Output,
     group_handle: &WorkspaceGroupHandle,
     active: bool,
+    tiling_engine: TilingEngine,
     theme: cosmic::Theme,
     appearance: AppearanceConfig,
 ) -> Workspace {
+    let tiling_enabled = pinned.tiling_enabled;
     let workspace_handle = state
         .create_workspace(
             group_handle,
-            if pinned.tiling_enabled {
+            if tiling_enabled {
                 TilingState::TilingEnabled
             } else {
                 TilingState::FloatingOnly
@@ -476,6 +481,7 @@ fn create_workspace_from_pinned(
         pinned,
         workspace_handle,
         output.clone(),
+        tiling_engine,
         theme.clone(),
         appearance,
     )
@@ -512,6 +518,7 @@ impl WorkspaceSet {
         state: &mut WorkspaceUpdateGuard<'_, State>,
         output: &Output,
         tiling_enabled: bool,
+        tiling_engine: TilingEngine,
         theme: &cosmic::Theme,
         appearance: AppearanceConfig,
     ) -> WorkspaceSet {
@@ -523,6 +530,7 @@ impl WorkspaceSet {
             active: 0,
             group: group_handle,
             tiling_enabled,
+            tiling_engine,
             theme: theme.clone(),
             sticky_layer,
             minimized_windows: Vec::new(),
@@ -535,6 +543,20 @@ impl WorkspaceSet {
     fn refresh_focus_stacks(&mut self) {
         for workspace in &mut self.workspaces {
             workspace.refresh_focus_stack();
+        }
+    }
+
+    fn set_tiling_engine(&mut self, tiling_engine: TilingEngine) {
+        self.tiling_engine = tiling_engine;
+        self.previously_active = None;
+
+        for workspace in &mut self.workspaces {
+            workspace.tiling_layer.set_mode(tiling_engine);
+            workspace
+                .tiling_layer
+                .mapped()
+                .for_each(|(mapped, _)| mapped.force_redraw());
+            workspace.dirty.store(true, Ordering::Relaxed);
         }
     }
 
@@ -652,6 +674,7 @@ impl WorkspaceSet {
             &self.group,
             false,
             self.tiling_enabled,
+            self.tiling_engine,
             self.theme.clone(),
             self.appearance,
         );
@@ -856,6 +879,7 @@ pub struct Workspaces {
     pub sets: IndexMap<Output, WorkspaceSet>,
     backup_set: Option<WorkspaceSet>,
     pub layout: WorkspaceLayout,
+    tiling_engine: TilingEngine,
     mode: WorkspaceMode,
     autotile: bool,
     autotile_behavior: TileBehavior,
@@ -871,12 +895,28 @@ impl Workspaces {
             sets: IndexMap::new(),
             backup_set: None,
             layout: config.cosmic_conf.workspaces.workspace_layout,
+            tiling_engine: config.cosmic_conf.tiling_engine,
             mode: config.cosmic_conf.workspaces.workspace_mode,
             autotile: config.cosmic_conf.autotile,
             autotile_behavior: config.cosmic_conf.autotile_behavior,
             theme,
             appearance: config.cosmic_conf.appearance_settings,
             persisted_workspaces: config.cosmic_conf.pinned_workspaces.clone(),
+        }
+    }
+
+    pub fn effective_layout(&self) -> WorkspaceLayout {
+        self.tiling_engine.effective_workspace_layout(self.layout)
+    }
+
+    pub fn set_tiling_engine(&mut self, tiling_engine: TilingEngine) {
+        self.tiling_engine = tiling_engine;
+
+        for set in self.sets.values_mut() {
+            set.set_tiling_engine(tiling_engine);
+        }
+        if let Some(set) = self.backup_set.as_mut() {
+            set.set_tiling_engine(tiling_engine);
         }
     }
 
@@ -894,6 +934,7 @@ impl Workspaces {
             .take()
             .map(|mut set| {
                 set.set_output(output, false);
+                set.set_tiling_engine(self.tiling_engine);
                 set
             })
             .unwrap_or_else(|| {
@@ -901,6 +942,7 @@ impl Workspaces {
                     workspace_state,
                     output,
                     self.autotile,
+                    self.tiling_engine,
                     &self.theme,
                     self.appearance,
                 )
@@ -915,6 +957,7 @@ impl Workspaces {
                 output,
                 &set.group,
                 false,
+                self.tiling_engine,
                 self.theme.clone(),
                 self.appearance,
             );
@@ -1249,6 +1292,7 @@ impl Workspaces {
                                     &set.group,
                                     false,
                                     config.cosmic_conf.autotile,
+                                    self.tiling_engine,
                                     self.theme.clone(),
                                     self.appearance,
                                 ),
@@ -2507,6 +2551,18 @@ impl Shell {
         }
     }
 
+    /// Immediately discard keyboard-swap preview state when its layout engine
+    /// changes. The keyboard focus itself is intentionally preserved.
+    pub(crate) fn cancel_keyboard_swap(&mut self) {
+        if matches!(
+            self.overview_mode.trigger(),
+            Some(Trigger::KeyboardSwap(..))
+        ) {
+            self.overview_mode = OverviewMode::None;
+            self.swap_indicator = None;
+        }
+    }
+
     pub fn overview_mode(&self) -> (OverviewMode, Option<SwapIndicator>) {
         if let OverviewMode::Started(trigger, timestamp) = &self.overview_mode
             && Instant::now().duration_since(*timestamp) > ANIMATION_DURATION
@@ -3153,7 +3209,7 @@ impl Shell {
             let focus_stack = workspace.focus_stack.get(&seat);
             workspace
                 .tiling_layer
-                .map(mapped.clone(), Some(focus_stack.iter()), None);
+                .map_new_toplevel(mapped.clone(), Some(focus_stack.iter()));
         }
 
         if should_be_sticky {
@@ -4372,6 +4428,66 @@ impl Shell {
         }
     }
 
+    pub fn cycle_scrolling_column_width(
+        &mut self,
+        direction: ResizeDirection,
+        seat: &Seat<State>,
+    ) -> bool {
+        let Some(output) = seat.focused_output() else {
+            return false;
+        };
+        let Some(workspace) = self.active_space_mut(&output) else {
+            return false;
+        };
+        workspace
+            .tiling_layer
+            .cycle_scrolling_column_width(direction, seat)
+    }
+
+    pub fn center_scrolling_column(&mut self, seat: &Seat<State>) -> bool {
+        let Some(output) = seat.focused_output() else {
+            return false;
+        };
+        let Some(workspace) = self.active_space_mut(&output) else {
+            return false;
+        };
+        workspace.tiling_layer.center_scrolling_column(seat)
+    }
+
+    pub fn scrolling_tiling_active(&self, seat: &Seat<State>) -> bool {
+        let Some(output) = seat.focused_output() else {
+            return false;
+        };
+        self.active_space(&output)
+            .is_some_and(|workspace| workspace.tiling_layer.mode() == TilingEngine::Scrolling)
+    }
+
+    /// Capture the workspace which may own a three-finger Scrolling pan.
+    pub fn scrolling_pan_target(&self, output: &Output) -> Option<WorkspaceHandle> {
+        self.active_space(output)
+            .filter(|workspace| workspace.tiling_layer.mode() == TilingEngine::Scrolling)
+            .map(|workspace| workspace.handle)
+    }
+
+    /// Apply a pan only while the original output and workspace remain active.
+    /// This prevents an in-flight gesture from migrating to a new workspace.
+    pub fn pan_scrolling_viewport(
+        &mut self,
+        output: &Output,
+        workspace_handle: WorkspaceHandle,
+        delta_x: f64,
+    ) -> Option<bool> {
+        let Some(workspace) = self.active_space_mut(output) else {
+            return None;
+        };
+        if workspace.handle != workspace_handle
+            || workspace.tiling_layer.mode() != TilingEngine::Scrolling
+        {
+            return None;
+        }
+        Some(workspace.tiling_layer.pan_scrolling_viewport(delta_x))
+    }
+
     #[must_use]
     pub fn move_current_element(&mut self, direction: Direction, seat: &Seat<State>) -> MoveResult {
         let Some(output) = seat.focused_output() else {
@@ -4500,7 +4616,21 @@ impl Shell {
         } else {
             let ws = self.space_for_mut(mapped)?;
             let node_id = mapped.tiling_node_id.lock().unwrap().clone()?;
-            let (node, left_up_idx, orientation) = ws.tiling_layer.resize_request(node_id, edge)?;
+            let (node, left_up_idx, orientation, scrolling_resize) =
+                if ws.tiling_layer.mode() == TilingEngine::Scrolling {
+                    let target = ws
+                        .tiling_layer
+                        .scrolling_resize_target(&node_id, edge, seat)?;
+                    (
+                        target.primary_tile().clone(),
+                        0,
+                        target.orientation(),
+                        Some(target),
+                    )
+                } else {
+                    let (node, idx, orientation) = ws.tiling_layer.resize_request(node_id, edge)?;
+                    (node, idx, orientation, None)
+                };
             ResizeForkGrab::new(
                 start_data,
                 new_loc.to_f64(),
@@ -4509,6 +4639,7 @@ impl Shell {
                 orientation,
                 ws.output.downgrade(),
                 ReleaseMode::Click,
+                scrolling_resize,
             )
             .into()
         };
@@ -4786,8 +4917,22 @@ impl Shell {
         } else {
             let ws = self.space_for_mut(&mapped)?;
             let node_id = mapped.tiling_node_id.lock().unwrap().clone()?;
-            let (node, left_up_idx, orientation) =
-                ws.tiling_layer.resize_request(node_id, edges)?;
+            let (node, left_up_idx, orientation, scrolling_resize) = if ws.tiling_layer.mode()
+                == TilingEngine::Scrolling
+            {
+                let target = ws
+                    .tiling_layer
+                    .scrolling_resize_target(&node_id, edges, seat)?;
+                (
+                    target.primary_tile().clone(),
+                    0,
+                    target.orientation(),
+                    Some(target),
+                )
+            } else {
+                let (node, idx, orientation) = ws.tiling_layer.resize_request(node_id, edges)?;
+                (node, idx, orientation, None)
+            };
             ResizeForkGrab::new(
                 start_data,
                 seat.get_pointer().unwrap().current_location().as_global(),
@@ -4796,6 +4941,7 @@ impl Shell {
                 orientation,
                 ws.output.downgrade(),
                 ReleaseMode::NoMouseButtons,
+                scrolling_resize,
             )
             .into()
         };

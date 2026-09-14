@@ -4,8 +4,12 @@ use smithay::backend::drm::{DrmNode, NodeType};
 use tracing::{info, warn};
 
 pub fn bool_var(name: &str) -> Option<bool> {
-    let value = std::env::var(name).ok()?.to_lowercase();
-    Some(["1", "true", "yes", "y"].contains(&value.as_str()))
+    let value = std::env::var(name).ok()?;
+    Some(is_truthy(&value))
+}
+
+pub(crate) fn is_truthy(value: &str) -> bool {
+    ["1", "true", "yes", "y"].contains(&value.to_lowercase().as_str())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -160,5 +164,21 @@ fn try_parse_dev_from_str(val: &str) -> Option<DeviceIdentifier> {
             .and_then(|res| res.ok())
             .unwrap_or(node);
         Some(DeviceIdentifier::Node(node))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_truthy;
+
+    #[test]
+    fn boolean_environment_values_only_accept_documented_truthy_forms() {
+        for value in ["1", "true", "TRUE", "yes", "Y"] {
+            assert!(is_truthy(value), "{value:?} should be truthy");
+        }
+
+        for value in ["0", "false", "no", "-1", "enabled", " true ", ""] {
+            assert!(!is_truthy(value), "{value:?} should not be truthy");
+        }
     }
 }

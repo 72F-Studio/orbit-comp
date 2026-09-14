@@ -5,7 +5,7 @@ use crate::{
     shell::{
         focus::target::PointerFocusTarget,
         grabs::{GrabStartData, GrabType, ReleaseMode},
-        layout::Orientation,
+        layout::{Orientation, scrolling::ColumnResizeAnchor},
     },
     utils::prelude::*,
 };
@@ -42,7 +42,35 @@ use smithay::{
     utils::{IsAlive, Logical, Point, Serial},
 };
 
-use super::super::{Data, TilingLayout};
+use super::super::Data;
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ScrollingResizeTarget {
+    Column {
+        tile: NodeId,
+        anchor: ColumnResizeAnchor,
+    },
+    Rows {
+        upper: NodeId,
+        lower: NodeId,
+    },
+}
+
+impl ScrollingResizeTarget {
+    pub fn primary_tile(&self) -> &NodeId {
+        match self {
+            Self::Column { tile, .. } => tile,
+            Self::Rows { upper, .. } => upper,
+        }
+    }
+
+    pub fn orientation(&self) -> Orientation {
+        match self {
+            Self::Column { .. } => Orientation::Vertical,
+            Self::Rows { .. } => Orientation::Horizontal,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResizeForkTarget {
@@ -50,6 +78,7 @@ pub struct ResizeForkTarget {
     pub output: WeakOutput,
     pub left_up_idx: usize,
     pub orientation: Orientation,
+    pub scrolling_resize: Option<ScrollingResizeTarget>,
 }
 
 impl IsAlive for ResizeForkTarget {
@@ -84,6 +113,7 @@ impl PointerTarget<State> for ResizeForkTarget {
             let output = self.output.clone();
             let left_up_idx = self.left_up_idx;
             let orientation = self.orientation;
+            let scrolling_resize = self.scrolling_resize.clone();
             let serial = event.serial;
             let button = event.button;
             data.common.event_loop_handle.insert_idle(move |state| {
@@ -103,6 +133,7 @@ impl PointerTarget<State> for ResizeForkTarget {
                         orientation,
                         output,
                         ReleaseMode::NoMouseButtons,
+                        scrolling_resize,
                     ),
                     serial,
                     Focus::Clear,
@@ -138,6 +169,7 @@ impl TouchTarget<State> for ResizeForkTarget {
         let output = self.output.clone();
         let left_up_idx = self.left_up_idx;
         let orientation = self.orientation;
+        let scrolling_resize = self.scrolling_resize.clone();
         let serial = event.serial;
         let slot = event.slot;
         let location = event.location;
@@ -157,6 +189,7 @@ impl TouchTarget<State> for ResizeForkTarget {
                     orientation,
                     output,
                     ReleaseMode::NoMouseButtons,
+                    scrolling_resize,
                 ),
                 serial,
             )
@@ -299,6 +332,7 @@ pub struct ResizeForkGrab {
     left_up_idx: usize,
     orientation: Orientation,
     release: ReleaseMode,
+    scrolling_resize: Option<ScrollingResizeTarget>,
 }
 
 impl ResizeForkGrab {
@@ -310,6 +344,7 @@ impl ResizeForkGrab {
         orientation: Orientation,
         output: WeakOutput,
         release: ReleaseMode,
+        scrolling_resize: Option<ScrollingResizeTarget>,
     ) -> ResizeForkGrab {
         ResizeForkGrab {
             start_data,
@@ -321,6 +356,7 @@ impl ResizeForkGrab {
             left_up_idx: idx,
             orientation,
             release,
+            scrolling_resize,
         }
     }
 }
@@ -342,6 +378,27 @@ impl ResizeForkGrab {
                 return false;
             };
             let tiling_layer = &mut workspace.tiling_layer;
+
+            if let Some(target) = self.scrolling_resize.as_ref() {
+                self.accumulated_delta += match target {
+                    ScrollingResizeTarget::Column { anchor, .. } => anchor.width_delta(delta.x),
+                    ScrollingResizeTarget::Rows { .. } => delta.y,
+                };
+                let pixel_delta = self.accumulated_delta.round() as i32;
+                if pixel_delta == 0 {
+                    return false;
+                }
+                self.accumulated_delta -= f64::from(pixel_delta);
+                return match target {
+                    ScrollingResizeTarget::Column { tile, anchor } => tiling_layer
+                        .resize_scrolling_column(tile, pixel_delta, *anchor)
+                        .is_none(),
+                    ScrollingResizeTarget::Rows { upper, lower } => tiling_layer
+                        .resize_scrolling_rows(upper, lower, pixel_delta)
+                        .is_none(),
+                };
+            }
+
             let gaps = tiling_layer.gaps();
 
             let mut tree = tiling_layer.queue.trees.back().unwrap().0.copy_clone();
@@ -448,7 +505,7 @@ impl ResizeForkGrab {
                             _ => true,
                         });
                 if should_configure {
-                    let blocker = TilingLayout::update_positions(&output, &mut tree, gaps);
+                    let blocker = tiling_layer.update_positions_for(&mut tree, gaps);
                     tiling_layer.queue.push_tree(tree, None, blocker);
                 }
             } else {
@@ -456,6 +513,20 @@ impl ResizeForkGrab {
             }
         }
         false
+    }
+
+    fn finish_scrolling_resize(&self, data: &mut State) {
+        if self.scrolling_resize.is_none() {
+            return;
+        }
+        let Some(output) = self.output.upgrade() else {
+            return;
+        };
+        let mut shell = data.common.shell.write();
+        let Some(workspace) = shell.active_space_mut(&output) else {
+            return;
+        };
+        workspace.tiling_layer.finish_scrolling_resize();
     }
 
     pub fn grab_type(&self) -> GrabType {
@@ -617,6 +688,7 @@ impl PointerGrab<State> for ResizeForkGrab {
 
     fn unset(&mut self, data: &mut State) {
         self.update_location(data, self.last_loc.as_logical(), true);
+        self.finish_scrolling_resize(data);
     }
 }
 
@@ -695,6 +767,7 @@ impl TouchGrab<State> for ResizeForkGrab {
 
     fn unset(&mut self, data: &mut State) {
         self.update_location(data, self.last_loc.as_logical(), true);
+        self.finish_scrolling_resize(data);
     }
 }
 

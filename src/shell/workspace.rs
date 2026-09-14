@@ -21,8 +21,8 @@ use crate::{
         },
     },
 };
-use cosmic_comp_config::AppearanceConfig;
 use cosmic_comp_config::workspace::{OutputMatch, PinnedWorkspace};
+use cosmic_comp_config::{AppearanceConfig, TilingEngine};
 
 use cosmic::theme::CosmicTheme;
 use cosmic_protocols::workspace::v2::server::zcosmic_workspace_handle_v2::TilingState;
@@ -363,6 +363,7 @@ impl FocusResult {
 #[derive(Debug, Clone, PartialEq)]
 pub enum MoveResult {
     None,
+    Handled,
     Done,
     MoveFurther(KeyboardFocusTarget),
     ShiftFocus(KeyboardFocusTarget),
@@ -385,10 +386,11 @@ impl Workspace {
         handle: WorkspaceHandle,
         output: Output,
         tiling_enabled: bool,
+        tiling_engine: TilingEngine,
         theme: cosmic::Theme,
         appearance: AppearanceConfig,
     ) -> Workspace {
-        let tiling_layer = TilingLayout::new(theme.clone(), appearance, &output);
+        let tiling_layer = TilingLayout::new(theme.clone(), appearance, &output, tiling_engine);
         let floating_layer = FloatingLayout::new(theme, appearance, &output);
         let output_match = output_match_for_output(&output);
 
@@ -419,10 +421,11 @@ impl Workspace {
         pinned: &PinnedWorkspace,
         handle: WorkspaceHandle,
         output: Output,
+        tiling_engine: TilingEngine,
         theme: cosmic::Theme,
         appearance: AppearanceConfig,
     ) -> Self {
-        let tiling_layer = TilingLayout::new(theme.clone(), appearance, &output);
+        let tiling_layer = TilingLayout::new(theme.clone(), appearance, &output, tiling_engine);
         let floating_layer = FloatingLayout::new(theme, appearance, &output);
         let output_match = output_match_for_output(&output);
 

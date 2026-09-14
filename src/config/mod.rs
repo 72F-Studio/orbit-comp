@@ -2,7 +2,11 @@
 
 use crate::{
     input::InputBackendId,
-    shell::Shell,
+    shell::{
+        Shell,
+        grabs::ResizeGrab,
+        layout::tiling::{ResizeForkGrab, SwapWindowGrab},
+    },
     state::{BackendData, State},
     utils::prelude::OutputExt,
     wayland::protocols::{
@@ -50,7 +54,8 @@ use cosmic::config::CosmicTk;
 pub use cosmic_comp_config::EdidProduct;
 use cosmic_comp_config::{
     ActivationPolicy, AppearanceConfig, CosmicCompConfig, CursorHideConfig, DecorationPreference,
-    KeyboardConfig, TileBehavior, XkbConfig, XwaylandDescaling, XwaylandEavesdropping, ZoomConfig,
+    KeyboardConfig, TileBehavior, TilingEngine, XkbConfig, XwaylandDescaling,
+    XwaylandEavesdropping, ZoomConfig,
     input::{DeviceState as InputDeviceState, InputConfig, TouchpadOverride},
     output::comp::{
         OutputConfig, OutputInfo, OutputState, OutputsConfig, TransformDef, load_outputs,
@@ -74,6 +79,17 @@ pub struct Config {
     pub tiling_exceptions: Vec<ApplicationException>,
     /// System actions from `com.system76.CosmicSettings.Shortcuts`
     pub system_actions: BTreeMap<shortcuts::action::System, String>,
+}
+
+fn initial_tiling_engine(
+    configured: TilingEngine,
+    development_override: Option<&str>,
+) -> TilingEngine {
+    if development_override.is_some_and(crate::utils::env::is_truthy) {
+        TilingEngine::Scrolling
+    } else {
+        configured
+    }
 }
 
 #[derive(Debug)]
@@ -191,6 +207,11 @@ impl Config {
                 }
                 c
             });
+        let development_override = std::env::var("COSMIC_SCROLLING_TILING").ok();
+        cosmic_comp_config.tiling_engine = initial_tiling_engine(
+            cosmic_comp_config.tiling_engine,
+            development_override.as_deref(),
+        );
 
         // `cursor_hide_timeout` was replaced by the grouped `cursor_hide` key.
         // Seed the new key once so configs hand-edited before the rename keep
@@ -790,6 +811,56 @@ fn update_input(state: &mut State) {
     }
 }
 
+/// Finish compositor-owned tiling interactions before changing layout engines.
+///
+/// Tiling resize grabs retain a snapshot of the current layout tree, so allowing
+/// one to survive an engine switch could restore geometry from the old engine on
+/// its next event. Other pointer, touch, and keyboard grabs are deliberately left
+/// alone.
+fn quiesce_tiling_engine_interactions(state: &mut State) {
+    let seats = state
+        .common
+        .shell
+        .read()
+        .seats
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    for seat in seats {
+        if let Some(pointer) = seat.get_pointer()
+            && pointer.with_grab(|_, grab| {
+                grab.is::<ResizeForkGrab>()
+                    || grab
+                        .downcast_ref::<ResizeGrab>()
+                        .is_some_and(|grab| matches!(grab, ResizeGrab::Tiling(_)))
+            }) == Some(true)
+        {
+            pointer.unset_grab(
+                state,
+                SERIAL_COUNTER.next_serial(),
+                state.common.clock.now().as_millis(),
+            );
+        }
+
+        if let Some(touch) = seat.get_touch()
+            && touch.with_grab(|_, grab| {
+                grab.is::<ResizeForkGrab>()
+                    || grab
+                        .downcast_ref::<ResizeGrab>()
+                        .is_some_and(|grab| matches!(grab, ResizeGrab::Tiling(_)))
+            }) == Some(true)
+        {
+            touch.unset_grab(state);
+        }
+
+        if let Some(keyboard) = seat.get_keyboard()
+            && keyboard.with_grab(|_, grab| grab.is::<SwapWindowGrab>()) == Some(true)
+        {
+            keyboard.unset_grab(state);
+        }
+    }
+}
+
 pub fn change_modifier_state(
     keyboard: &smithay::input::keyboard::KeyboardHandle<State>,
     scan_code: u32,
@@ -907,6 +978,25 @@ fn config_changed(config: cosmic_config::Config, keys: Vec<String>, state: &mut 
                 state.common.config.cosmic_conf.workspaces =
                     get_config::<WorkspaceConfig>(&config, "workspaces");
                 state.common.update_config();
+            }
+            "tiling_engine" => {
+                let new = get_config::<TilingEngine>(&config, "tiling_engine");
+                if new != state.common.config.cosmic_conf.tiling_engine {
+                    quiesce_tiling_engine_interactions(state);
+                    if let Some(gesture) = state.common.gesture_state.as_mut() {
+                        gesture.action = None;
+                    }
+                    state.common.config.cosmic_conf.tiling_engine = new;
+                    let outputs = {
+                        let mut shell = state.common.shell.write();
+                        shell.cancel_keyboard_swap();
+                        shell.workspaces.set_tiling_engine(new);
+                        shell.outputs().cloned().collect::<Vec<_>>()
+                    };
+                    for output in &outputs {
+                        state.backend.schedule_render(output);
+                    }
+                }
             }
             "autotile" => {
                 let new = get_config::<bool>(&config, "autotile");
@@ -1058,5 +1148,39 @@ impl From<Output> for CompOutputInfo {
             make: physical.make,
             model: physical.model,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TilingEngine, initial_tiling_engine};
+
+    #[test]
+    fn development_override_only_enables_scrolling_for_truthy_values() {
+        assert_eq!(
+            initial_tiling_engine(TilingEngine::Classic, Some("1")),
+            TilingEngine::Scrolling
+        );
+        assert_eq!(
+            initial_tiling_engine(TilingEngine::Classic, Some("YES")),
+            TilingEngine::Scrolling
+        );
+
+        for value in [None, Some("0"), Some("false"), Some("-1"), Some("invalid")] {
+            assert_eq!(
+                initial_tiling_engine(TilingEngine::Classic, value),
+                TilingEngine::Classic
+            );
+        }
+    }
+
+    #[test]
+    fn negative_development_override_does_not_replace_configured_scrolling() {
+        for value in [None, Some("0"), Some("false"), Some("invalid")] {
+            assert_eq!(
+                initial_tiling_engine(TilingEngine::Scrolling, value),
+                TilingEngine::Scrolling
+            );
+        }
     }
 }

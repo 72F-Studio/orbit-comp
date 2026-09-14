@@ -22,7 +22,12 @@ use crate::{
             target::{KeyboardFocusTarget, PointerFocusTarget, WindowGroup},
         },
         grabs::ResizeEdge,
-        layout::Orientation,
+        layout::{
+            Orientation,
+            scrolling::{
+                ColumnDropTarget, ColumnResizeAnchor, FocusNavigation, ScrollingLayout, TileMove,
+            },
+        },
     },
     utils::{prelude::*, tween::EaseRectangle},
     wayland::{
@@ -37,7 +42,7 @@ use crate::{
     },
 };
 
-use cosmic_comp_config::AppearanceConfig;
+use cosmic_comp_config::{AppearanceConfig, TilingEngine};
 use cosmic_settings_config::shortcuts::action::{FocusDirection, ResizeDirection};
 use id_tree::{InsertBehavior, MoveBehavior, Node, NodeId, NodeIdError, RemoveBehavior, Tree};
 use keyframe::{
@@ -111,10 +116,98 @@ impl TargetZone {
     }
 }
 
+fn scrolling_drop_target(
+    tree: &Tree<Data>,
+    target: Option<&TargetZone>,
+) -> ColumnDropTarget<NodeId> {
+    let boundary_tile = |node_id: &NodeId, first: bool| {
+        let tiles = tree.traverse_pre_order_ids(node_id).ok()?.filter(|id| {
+            matches!(
+                tree.get(id).map(|node| node.data()),
+                Ok(Data::Mapped { .. })
+                    | Ok(Data::Placeholder {
+                        type_: PlaceholderType::GrabbedWindow,
+                        ..
+                    })
+            )
+        });
+        if first {
+            tiles.into_iter().next()
+        } else {
+            tiles.last()
+        }
+    };
+
+    match target {
+        None | Some(TargetZone::InitialPlaceholder(_)) => ColumnDropTarget::Original,
+        Some(TargetZone::Initial) => ColumnDropTarget::Last,
+        Some(TargetZone::WindowStack(..)) => ColumnDropTarget::Discard,
+        Some(TargetZone::WindowSplit(node_id, Direction::Left)) => {
+            ColumnDropTarget::Before(node_id.clone())
+        }
+        Some(TargetZone::WindowSplit(node_id, Direction::Right)) => {
+            ColumnDropTarget::After(node_id.clone())
+        }
+        Some(TargetZone::WindowSplit(node_id, Direction::Up)) => {
+            ColumnDropTarget::Above(node_id.clone())
+        }
+        Some(TargetZone::WindowSplit(node_id, Direction::Down)) => {
+            ColumnDropTarget::Below(node_id.clone())
+        }
+        Some(TargetZone::GroupEdge(node_id, Direction::Left)) => boundary_tile(node_id, true)
+            .map(ColumnDropTarget::Before)
+            .unwrap_or(ColumnDropTarget::First),
+        Some(TargetZone::GroupEdge(node_id, Direction::Right)) => boundary_tile(node_id, false)
+            .map(ColumnDropTarget::After)
+            .unwrap_or(ColumnDropTarget::Last),
+        Some(TargetZone::GroupEdge(node_id, Direction::Up)) => boundary_tile(node_id, true)
+            .map(ColumnDropTarget::Above)
+            .unwrap_or(ColumnDropTarget::First),
+        Some(TargetZone::GroupEdge(node_id, Direction::Down)) => boundary_tile(node_id, false)
+            .map(ColumnDropTarget::Below)
+            .unwrap_or(ColumnDropTarget::Last),
+        Some(TargetZone::GroupInterior(node_id, index)) => {
+            let Some((orientation, children)) = tree.get(node_id).ok().and_then(|node| {
+                if let Data::Group { orientation, .. } = node.data() {
+                    Some((*orientation, node.children().to_vec()))
+                } else {
+                    None
+                }
+            }) else {
+                return ColumnDropTarget::Last;
+            };
+            let previous = children
+                .get(*index)
+                .and_then(|child| boundary_tile(child, false));
+            let next = children
+                .get(index + 1)
+                .and_then(|child| boundary_tile(child, true));
+            match orientation {
+                Orientation::Vertical => previous
+                    .map(ColumnDropTarget::After)
+                    .or_else(|| next.map(ColumnDropTarget::Before))
+                    .unwrap_or(ColumnDropTarget::Last),
+                Orientation::Horizontal => previous
+                    .map(ColumnDropTarget::Below)
+                    .or_else(|| next.map(ColumnDropTarget::Above))
+                    .unwrap_or(ColumnDropTarget::Last),
+            }
+        }
+    }
+}
+
+fn scrolling_edge_focus_result(direction: FocusDirection) -> FocusResult {
+    match direction {
+        FocusDirection::Up | FocusDirection::Down => FocusResult::None,
+        _ => FocusResult::Handled,
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct TreeQueue {
     trees: VecDeque<(Tree<Data>, Duration, Option<TilingBlocker>)>,
     animation_start: Option<Instant>,
+    retired_blocker: Option<TilingBlocker>,
 }
 
 impl TreeQueue {
@@ -127,12 +220,212 @@ impl TreeQueue {
         self.trees
             .push_back((tree, duration.into().unwrap_or(Duration::ZERO), blocker))
     }
+
+    /// Keep direct-manipulation updates bounded while the compositor has not
+    /// started presenting the previous zero-duration target yet.
+    fn push_direct_tree(&mut self, tree: Tree<Data>, blocker: Option<TilingBlocker>) {
+        if self.animation_start.is_none()
+            && self.trees.len() > 1
+            && self
+                .trees
+                .back()
+                .is_some_and(|(_, duration, _)| *duration == Duration::ZERO)
+        {
+            let (queued_tree, _, queued_blocker) = self.trees.back_mut().unwrap();
+            let retired = queued_blocker.take();
+            *queued_tree = tree;
+            *queued_blocker = blocker;
+            if let Some(retired) = retired {
+                self.retire_blocker(retired);
+            }
+            return;
+        }
+        self.push_tree(tree, Duration::ZERO, blocker);
+    }
+
+    fn retire_blocker(&mut self, blocker: TilingBlocker) {
+        if let Some(retired) = self.retired_blocker.as_mut() {
+            retired.absorb(blocker);
+        } else {
+            self.retired_blocker = Some(blocker);
+        }
+    }
+
+    fn retire_queued_blockers(&mut self) {
+        let blockers = self
+            .trees
+            .iter_mut()
+            .filter_map(|(_, _, blocker)| blocker.take())
+            .collect::<Vec<_>>();
+        for blocker in blockers {
+            self.retire_blocker(blocker);
+        }
+    }
+
+    /// Snapshot the rectangles currently being rendered. The target topology
+    /// is retained so repeated moves keep stable node identities, while every
+    /// node shared with the reference tree starts at its current visual rect.
+    fn current_visual_tree(&self) -> Tree<Data> {
+        let Some(reference) = self.trees.front().map(|entry| &entry.0) else {
+            return Tree::new();
+        };
+        let Some(start) = self.animation_start else {
+            return reference.copy_clone();
+        };
+        let Some((target, duration, _)) = self.trees.get(1) else {
+            return reference.copy_clone();
+        };
+
+        let percentage = if *duration == Duration::ZERO {
+            1.0
+        } else {
+            let elapsed = Instant::now().duration_since(start).as_secs_f32();
+            let total = duration.as_secs_f32();
+            ease(EaseInOutCubic, 0.0, 1.0, (elapsed / total).clamp(0.0, 1.0))
+        };
+        let mut visual = target.copy_clone();
+        let Some(root) = target.root_node_id() else {
+            return visual;
+        };
+        for node_id in target
+            .traverse_pre_order_ids(root)
+            .expect("target tree root must be traversable")
+            .collect::<Vec<_>>()
+        {
+            let Ok(new) = target.get(&node_id) else {
+                continue;
+            };
+            let minimized_from = match new.data() {
+                Data::Mapped {
+                    minimize_rect: Some(rect),
+                    ..
+                } => Some(*rect),
+                _ => None,
+            };
+            let old_geometry = minimized_from.or_else(|| {
+                reference
+                    .get(&node_id)
+                    .ok()
+                    .map(|old| *old.data().geometry())
+            });
+            let Some(old_geometry) = old_geometry else {
+                continue;
+            };
+            let geometry = if minimized_from.is_some() {
+                ease(
+                    EaseInOutCubic,
+                    EaseRectangle(old_geometry),
+                    EaseRectangle(*new.data().geometry()),
+                    percentage,
+                )
+                .unwrap()
+            } else {
+                ease(
+                    Linear,
+                    EaseRectangle(old_geometry),
+                    EaseRectangle(*new.data().geometry()),
+                    percentage,
+                )
+                .unwrap()
+            };
+            if let Ok(node) = visual.get_mut(&node_id) {
+                node.data_mut().update_geometry(geometry);
+                if let Data::Mapped { minimize_rect, .. } = node.data_mut() {
+                    *minimize_rect = None;
+                }
+            }
+        }
+        visual
+    }
+
+    /// Stop any queued transition at its current visual rectangles. Configure
+    /// blockers remain tracked independently until their surfaces catch up.
+    fn interrupt(&mut self) -> Tree<Data> {
+        let visual = self.current_visual_tree();
+        self.retire_queued_blockers();
+        self.trees.clear();
+        self.trees
+            .push_back((visual.copy_clone(), Duration::ZERO, None));
+        self.animation_start = None;
+        visual
+    }
+
+    fn prepare_direct_tree(&mut self) -> Tree<Data> {
+        if self.animation_start.is_some() {
+            return self.interrupt();
+        }
+        if self.trees.len() > 1 {
+            if self
+                .trees
+                .back()
+                .is_some_and(|(_, duration, _)| *duration == Duration::ZERO)
+            {
+                return self.trees.back().unwrap().0.copy_clone();
+            }
+            return self.interrupt();
+        }
+        self.trees.back().unwrap().0.copy_clone()
+    }
+
+    /// Animate toward the newest authoritative tree without waiting behind an
+    /// older Scrolling transition or allowing the queue to grow.
+    fn push_retargetable_tree(
+        &mut self,
+        mut tree: Tree<Data>,
+        duration: Duration,
+        blocker: Option<TilingBlocker>,
+    ) {
+        if self.animation_start.is_some() || self.trees.len() > 1 {
+            clear_minimize_rects(&mut tree);
+            self.interrupt();
+        }
+        self.push_tree(tree, duration, blocker);
+    }
+
+    fn update_retired_blocker(&mut self, clients: &mut HashMap<ClientId, Client>) {
+        let Some(blocker) = self.retired_blocker.as_ref() else {
+            return;
+        };
+        if blocker.is_ready() {
+            clients.extend(blocker.clients());
+        }
+        if blocker.is_processed() {
+            self.retired_blocker = None;
+        }
+    }
+}
+
+fn clear_minimize_rects(tree: &mut Tree<Data>) {
+    let Some(root) = tree.root_node_id().cloned() else {
+        return;
+    };
+    for node_id in tree
+        .traverse_pre_order_ids(&root)
+        .expect("tree root must be traversable")
+        .collect::<Vec<_>>()
+    {
+        if let Ok(node) = tree.get_mut(&node_id)
+            && let Data::Mapped { minimize_rect, .. } = node.data_mut()
+        {
+            *minimize_rect = None;
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ScrollingLiveResize {
+    target: ScrollingResizeTarget,
+    tiles: Vec<NodeId>,
+    finishing: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct TilingLayout {
     output: Output,
     queue: TreeQueue,
+    tiling_engine: TilingEngine,
+    scrolling: ScrollingLayout,
+    scrolling_live_resize: Option<ScrollingLiveResize>,
     backdrop_id: Id,
     swapping_stack_surface_id: Id,
     last_overview_hover: Option<(Option<Instant>, TargetZone)>,
@@ -289,7 +582,7 @@ impl Data {
         }
     }
 
-    fn update_geometry(&mut self, geo: Rectangle<i32, Local>) {
+    pub(super) fn update_geometry(&mut self, geo: Rectangle<i32, Local>) {
         match self {
             Data::Group {
                 orientation,
@@ -353,6 +646,7 @@ impl TilingLayout {
         theme: cosmic::Theme,
         appearance: AppearanceConfig,
         output: &Output,
+        tiling_engine: TilingEngine,
     ) -> TilingLayout {
         TilingLayout {
             queue: TreeQueue {
@@ -362,14 +656,111 @@ impl TilingLayout {
                     queue
                 },
                 animation_start: None,
+                retired_blocker: None,
             },
             output: output.clone(),
+            tiling_engine,
+            scrolling: ScrollingLayout::default(),
+            scrolling_live_resize: None,
             backdrop_id: Id::new(),
             swapping_stack_surface_id: Id::new(),
             last_overview_hover: None,
             theme,
             appearance,
         }
+    }
+
+    pub fn mode(&self) -> TilingEngine {
+        self.tiling_engine
+    }
+
+    /// Switch tiling engines without changing the tree, mapped windows, or
+    /// scrolling column state.
+    ///
+    /// The newest queued tree is authoritative. Replacing the queue avoids
+    /// rendering or waiting on geometry from the previous engine while the
+    /// newly selected engine configures every mapped leaf immediately. The
+    /// persistent scrolling model keeps surviving columns in their prior
+    /// order; leaves first mapped while classic is active append in tree
+    /// pre-order when scrolling resumes.
+    pub fn set_mode(&mut self, tiling_engine: TilingEngine) {
+        if self.tiling_engine == tiling_engine {
+            return;
+        }
+
+        let gaps = self.gaps();
+        let mut tree = self
+            .queue
+            .trees
+            .back()
+            .expect("tiling layout must always contain a tree")
+            .0
+            .copy_clone();
+        if let Some(resize) = self.scrolling_live_resize.take() {
+            Self::set_scrolling_tiles_resizing(&tree, &resize.tiles, false);
+        }
+        let mut retired_blockers = self
+            .queue
+            .trees
+            .iter_mut()
+            .filter_map(|(_, _, blocker)| blocker.take())
+            .collect::<Vec<_>>();
+
+        self.tiling_engine = tiling_engine;
+        self.last_overview_hover = TilingLayout::clear_transient_tree_state(&mut tree)
+            .map(|node_id| (None, TargetZone::InitialPlaceholder(node_id)));
+
+        // update_positions_for sends the new geometry/configures. Both its
+        // blocker and blockers from superseded queue entries still need to be
+        // polled so their surface commit barriers can be released.
+        if let Some(blocker) = self.update_positions_for(&mut tree, gaps) {
+            retired_blockers.push(blocker);
+        }
+        self.queue.trees.clear();
+        self.queue
+            .trees
+            .push_back((tree.copy_clone(), Duration::ZERO, None));
+        for blocker in retired_blockers {
+            self.queue
+                .trees
+                .push_back((tree.copy_clone(), Duration::ZERO, Some(blocker)));
+        }
+        self.queue.animation_start = None;
+    }
+
+    fn clear_transient_tree_state(tree: &mut Tree<Data>) -> Option<NodeId> {
+        let Some(root) = tree.root_node_id().cloned() else {
+            return None;
+        };
+        let mut grabbed_placeholder = None;
+
+        for id in tree
+            .traverse_pre_order_ids(&root)
+            .expect("root node must be traversable")
+            .collect::<Vec<_>>()
+        {
+            match tree.get_mut(&id).map(|node| node.data_mut()) {
+                Ok(Data::Placeholder {
+                    type_: PlaceholderType::GrabbedWindow,
+                    ..
+                }) => {
+                    grabbed_placeholder.get_or_insert(id);
+                }
+                Ok(Data::Placeholder {
+                    type_: PlaceholderType::DropZone,
+                    ..
+                }) => TilingLayout::unmap_internal(tree, &id),
+                Ok(Data::Group { pill_indicator, .. }) => {
+                    *pill_indicator = None;
+                }
+                Ok(Data::Mapped { minimize_rect, .. }) => {
+                    *minimize_rect = None;
+                }
+                _ => {}
+            }
+        }
+
+        grabbed_placeholder
     }
 
     pub fn set_output(&mut self, output: &Output) {
@@ -388,9 +779,9 @@ impl TilingLayout {
             }
         }
 
-        let blocker = TilingLayout::update_positions(output, &mut tree, gaps);
-        self.queue.push_tree(tree, None, blocker);
         self.output = output.clone();
+        let blocker = self.update_positions_for(&mut tree, gaps);
+        self.queue.push_tree(tree, None, blocker);
     }
 
     pub fn map<'a>(
@@ -402,6 +793,42 @@ impl TilingLayout {
         window.output_enter(&self.output, window.bbox());
         window.set_bounds(self.output.geometry().size.as_logical());
         self.map_internal(window, focus_stack, direction, None);
+    }
+
+    /// Map a newly created toplevel. Scrolling uses this explicit lifecycle
+    /// signal to place it beside the focused column; all restoration and
+    /// transfer paths continue through `map`/`remap` and reconciliation.
+    pub fn map_new_toplevel<'a>(
+        &mut self,
+        window: CosmicMapped,
+        focus_stack: Option<impl Iterator<Item = &'a FocusTarget> + 'a>,
+    ) {
+        window.output_enter(&self.output, window.bbox());
+        window.set_bounds(self.output.geometry().size.as_logical());
+
+        let gaps = self.gaps();
+        let mut tree = self.queue.trees.back().unwrap().0.copy_clone();
+        let last_active = focus_stack
+            .and_then(|focus_stack| TilingLayout::last_active_window(&tree, focus_stack))
+            .map(|(node_id, _)| node_id);
+
+        TilingLayout::map_to_tree(
+            &mut tree,
+            window.clone(),
+            &self.output,
+            last_active.clone(),
+            None,
+            None,
+        );
+        if self.tiling_engine == TilingEngine::Scrolling
+            && let Some(new_id) = window.tiling_node_id.lock().unwrap().clone()
+        {
+            self.scrolling
+                .insert_new_toplevel(new_id, last_active.as_ref());
+        }
+
+        let blocker = self.update_positions_for(&mut tree, gaps);
+        self.queue.push_tree(tree, ANIMATION_DURATION, blocker);
     }
 
     pub fn map_internal<'a>(
@@ -431,7 +858,7 @@ impl TilingLayout {
             direction,
             minimize_rect,
         );
-        let blocker = TilingLayout::update_positions(&self.output, &mut tree, gaps);
+        let blocker = self.update_positions_for(&mut tree, gaps);
         self.queue.push_tree(tree, duration, blocker);
     }
 
@@ -496,7 +923,7 @@ impl TilingLayout {
                 tree.make_nth_sibling(&new_id, idx).unwrap();
                 *window.tiling_node_id.lock().unwrap() = Some(new_id);
 
-                let blocker = TilingLayout::update_positions(&self.output, &mut tree, gaps);
+                let blocker = self.update_positions_for(&mut tree, gaps);
                 self.queue
                     .push_tree(tree, MINIMIZE_ANIMATION_DURATION, blocker);
                 return;
@@ -534,7 +961,7 @@ impl TilingLayout {
 
                 *window.tiling_node_id.lock().unwrap() = Some(new_id);
 
-                let blocker = TilingLayout::update_positions(&self.output, &mut tree, gaps);
+                let blocker = self.update_positions_for(&mut tree, gaps);
                 self.queue
                     .push_tree(tree, MINIMIZE_ANIMATION_DURATION, blocker);
                 return;
@@ -637,7 +1064,7 @@ impl TilingLayout {
             old.output_leave(&self.output);
             new.output_enter(&self.output, new.bbox());
 
-            let blocker = TilingLayout::update_positions(&self.output, &mut tree, gaps);
+            let blocker = self.update_positions_for(&mut tree, gaps);
             self.queue.push_tree(tree, ANIMATION_DURATION, blocker);
         }
     }
@@ -814,12 +1241,10 @@ impl TilingLayout {
                 let other_gaps = other.gaps();
 
                 TilingLayout::unmap_internal(&mut this_tree, &desc.node);
-                let blocker =
-                    TilingLayout::update_positions(&this.output, &mut this_tree, this_gaps);
+                let blocker = this.update_positions_for(&mut this_tree, this_gaps);
                 this.queue.push_tree(this_tree, ANIMATION_DURATION, blocker);
 
-                let blocker =
-                    TilingLayout::update_positions(&other.output, &mut other_tree, other_gaps);
+                let blocker = other.update_positions_for(&mut other_tree, other_gaps);
                 other
                     .queue
                     .push_tree(other_tree, ANIMATION_DURATION, blocker);
@@ -1255,19 +1680,22 @@ impl TilingLayout {
         }
 
         let this_gaps = this.gaps();
-        let blocker = TilingLayout::update_positions(&this.output, &mut this_tree, this_gaps);
+        let blocker = this.update_positions_for(&mut this_tree, this_gaps);
         this.queue.push_tree(this_tree, ANIMATION_DURATION, blocker);
 
         let has_other_tree = other_tree.is_some();
         if let Some(mut other_tree) = other_tree {
-            let (other_queue, gaps) = if let Some(other) = other.as_mut() {
+            if let Some(other) = other.as_mut() {
                 let other_gaps = other.gaps();
-                (&mut other.queue, other_gaps)
+                let blocker = other.update_positions_for(&mut other_tree, other_gaps);
+                other
+                    .queue
+                    .push_tree(other_tree, ANIMATION_DURATION, blocker);
             } else {
-                (&mut this.queue, this_gaps)
-            };
-            let blocker = TilingLayout::update_positions(&other_output, &mut other_tree, gaps);
-            other_queue.push_tree(other_tree, ANIMATION_DURATION, blocker);
+                let blocker = this.update_positions_for(&mut other_tree, this_gaps);
+                this.queue
+                    .push_tree(other_tree, ANIMATION_DURATION, blocker);
+            }
         }
 
         match (&this_desc.stack_window, &other_desc.stack_window) {
@@ -1384,9 +1812,14 @@ impl TilingLayout {
     ) -> Option<NodeId> {
         let node_id = window.tiling_node_id.lock().unwrap().take()?;
 
+        if self.tiling_engine == TilingEngine::Scrolling {
+            self.prepare_scrolling_direct_tree();
+        }
+
         // Initialize last_overview_hover to the placeholder position so that
         // dropping without mouse movement restores the window to its original position
         if matches!(type_, PlaceholderType::GrabbedWindow) {
+            self.scrolling.begin_drag(&node_id);
             self.last_overview_hover =
                 Some((None, TargetZone::InitialPlaceholder(node_id.clone())));
         }
@@ -1435,8 +1868,12 @@ impl TilingLayout {
             } else {
                 ANIMATION_DURATION
             };
-            let blocker = TilingLayout::update_positions(&self.output, &mut tree, gaps);
-            self.queue.push_tree(tree, duration, blocker);
+            let blocker = self.update_positions_for(&mut tree, gaps);
+            if self.tiling_engine == TilingEngine::Scrolling {
+                self.queue.push_retargetable_tree(tree, duration, blocker);
+            } else {
+                self.queue.push_tree(tree, duration, blocker);
+            }
 
             return true;
         }
@@ -1504,6 +1941,209 @@ impl TilingLayout {
         }
     }
 
+    fn prepare_scrolling_direct_tree(&mut self) -> Tree<Data> {
+        let gaps = self.gaps();
+        let tree = self.queue.prepare_direct_tree();
+        self.scrolling
+            .sync_viewport_from_tree(&self.output, &tree, gaps);
+        tree
+    }
+
+    fn set_scrolling_tiles_resizing(tree: &Tree<Data>, tiles: &[NodeId], resizing: bool) {
+        for tile in tiles {
+            if let Ok(node) = tree.get(tile)
+                && let Data::Mapped { mapped, .. } = node.data()
+            {
+                mapped.set_resizing(resizing);
+            }
+        }
+    }
+
+    fn set_scrolling_live_resize(
+        &mut self,
+        tree: &Tree<Data>,
+        target: ScrollingResizeTarget,
+        tiles: Vec<NodeId>,
+    ) {
+        if self
+            .scrolling_live_resize
+            .as_ref()
+            .is_some_and(|resize| !resize.finishing && resize.target == target)
+        {
+            return;
+        }
+        if let Some(previous) = self.scrolling_live_resize.take() {
+            Self::set_scrolling_tiles_resizing(tree, &previous.tiles, false);
+        }
+        Self::set_scrolling_tiles_resizing(tree, &tiles, true);
+        self.scrolling_live_resize = Some(ScrollingLiveResize {
+            target,
+            tiles,
+            finishing: false,
+        });
+    }
+
+    fn scrolling_live_resize_target_exists(&self, target: &ScrollingResizeTarget) -> bool {
+        match target {
+            ScrollingResizeTarget::Column { tile, .. } => {
+                self.scrolling.tiles_in_column(tile).is_some()
+            }
+            ScrollingResizeTarget::Rows { upper, lower } => self
+                .scrolling
+                .row_pair(upper, 1)
+                .is_some_and(|pair| pair == (upper.clone(), lower.clone())),
+        }
+    }
+
+    fn update_scrolling_live_resize_state(&mut self) {
+        let Some(resize) = self.scrolling_live_resize.clone() else {
+            return;
+        };
+        if !self.scrolling_live_resize_target_exists(&resize.target) {
+            let tree = &self.queue.trees.back().unwrap().0;
+            Self::set_scrolling_tiles_resizing(tree, &resize.tiles, false);
+            self.scrolling_live_resize = None;
+            return;
+        }
+        if !resize.finishing {
+            return;
+        }
+        let tree = &self.queue.trees.back().unwrap().0;
+        let pending = resize
+            .tiles
+            .into_iter()
+            .filter(|tile| match tree.get(tile).ok().map(|node| node.data()) {
+                Some(Data::Mapped { mapped, .. }) => live_resize_tile_is_pending(
+                    mapped.active_window().latest_size_committed(),
+                    mapped.is_resizing(false).unwrap_or(false),
+                ),
+                _ => false,
+            })
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            self.scrolling_live_resize = None;
+        } else if let Some(resize) = self.scrolling_live_resize.as_mut() {
+            // A fast client returns to normal rendering without waiting for a
+            // slower adjacent tile to finish its final configure.
+            resize.tiles = pending;
+        }
+    }
+
+    fn push_scrolling_animation(&mut self, tree: Tree<Data>, blocker: Option<TilingBlocker>) {
+        debug_assert_eq!(self.tiling_engine, TilingEngine::Scrolling);
+        self.queue
+            .push_retargetable_tree(tree, ANIMATION_DURATION, blocker);
+    }
+
+    /// Keep a newly focused scrolling column inside the output viewport.
+    pub fn ensure_visible(&mut self, elem: &CosmicMapped) {
+        if self.tiling_engine != TilingEngine::Scrolling {
+            return;
+        }
+        let Some(node_id) = elem.tiling_node_id.lock().unwrap().clone() else {
+            return;
+        };
+        if !self.scrolling.ensure_visible(&node_id) {
+            return;
+        }
+
+        let gaps = self.gaps();
+        let mut tree = self.queue.trees.back().unwrap().0.copy_clone();
+        let blocker =
+            self.scrolling
+                .update_positions_ensuring(&self.output, &mut tree, gaps, Some(&node_id));
+        self.push_scrolling_animation(tree, blocker);
+    }
+
+    /// Pan Scrolling geometry immediately. This changes only the virtual
+    /// viewport; focus, tile order, and window sizes remain untouched.
+    pub fn pan_scrolling_viewport(&mut self, delta_x: f64) -> bool {
+        if self.tiling_engine != TilingEngine::Scrolling || !delta_x.is_finite() {
+            return false;
+        }
+        let interrupted = self.queue.animation_start.is_some() || self.queue.trees.len() > 1;
+        let gaps = self.gaps();
+        let mut tree = self.prepare_scrolling_direct_tree();
+        if !self.scrolling.pan_viewport(delta_x) {
+            return interrupted;
+        }
+
+        let blocker = self
+            .scrolling
+            .update_positions_ensuring(&self.output, &mut tree, gaps, None);
+        self.queue.push_direct_tree(tree, blocker);
+        true
+    }
+
+    pub fn cycle_scrolling_column_width(
+        &mut self,
+        direction: ResizeDirection,
+        seat: &Seat<State>,
+    ) -> bool {
+        if self.tiling_engine != TilingEngine::Scrolling {
+            return false;
+        }
+
+        let Some(target) = seat.get_keyboard().unwrap().current_focus() else {
+            return false;
+        };
+        let Some((node_id, FocusedNodeData::Window(_))) =
+            TilingLayout::currently_focused_node(self.tree(), target)
+        else {
+            return false;
+        };
+        self.cycle_scrolling_column_width_for(&node_id, direction)
+    }
+
+    fn cycle_scrolling_column_width_for(
+        &mut self,
+        node_id: &NodeId,
+        direction: ResizeDirection,
+    ) -> bool {
+        if self.tiling_engine != TilingEngine::Scrolling {
+            return false;
+        }
+
+        let mut tree = self.queue.trees.back().unwrap().0.copy_clone();
+        if !self.scrolling.cycle_column_width(node_id, direction) {
+            return false;
+        }
+
+        let gaps = self.gaps();
+        let blocker =
+            self.scrolling
+                .update_positions_ensuring(&self.output, &mut tree, gaps, Some(node_id));
+        self.push_scrolling_animation(tree, blocker);
+        true
+    }
+
+    pub fn center_scrolling_column(&mut self, seat: &Seat<State>) -> bool {
+        if self.tiling_engine != TilingEngine::Scrolling {
+            return false;
+        }
+
+        let mut tree = self.queue.trees.back().unwrap().0.copy_clone();
+        let Some(target) = seat.get_keyboard().unwrap().current_focus() else {
+            return false;
+        };
+        let Some((node_id, FocusedNodeData::Window(mapped))) =
+            TilingLayout::currently_focused_node(&tree, target)
+        else {
+            return false;
+        };
+        if mapped.is_maximized(true) || mapped.is_fullscreen(true) {
+            return false;
+        }
+        if !self.scrolling.request_center(&node_id) {
+            return false;
+        }
+
+        let gaps = self.gaps();
+        let blocker = self.update_positions_for(&mut tree, gaps);
+        self.push_scrolling_animation(tree, blocker);
+        true
+    }
+
     pub fn move_current_node(&mut self, direction: Direction, seat: &Seat<State>) -> MoveResult {
         let gaps = self.gaps();
 
@@ -1515,6 +2155,45 @@ impl TilingLayout {
         let Some((node_id, data)) = TilingLayout::currently_focused_node(&tree, target) else {
             return MoveResult::None;
         };
+
+        if self.tiling_engine == TilingEngine::Scrolling {
+            let current_focus = match &data {
+                FocusedNodeData::Window(window) => KeyboardFocusTarget::Element(window.clone()),
+                FocusedNodeData::Group(focus_stack, alive) => {
+                    KeyboardFocusTarget::Group(WindowGroup {
+                        node: node_id.clone(),
+                        alive: alive.clone(),
+                        focus_stack: focus_stack.clone(),
+                    })
+                }
+            };
+
+            if matches!(direction, Direction::Up | Direction::Down) {
+                return match self.scrolling.move_tile_vertical(&node_id, direction) {
+                    TileMove::Moved => {
+                        let blocker = self.update_positions_for(&mut tree, gaps);
+                        self.push_scrolling_animation(tree, blocker);
+                        MoveResult::Handled
+                    }
+                    TileMove::Edge => MoveResult::MoveFurther(current_focus),
+                    TileMove::Unavailable => MoveResult::Handled,
+                };
+            }
+
+            let moved = {
+                let moved = self.scrolling.move_column(&node_id, direction);
+                if moved {
+                    self.scrolling.ensure_visible(&node_id);
+                }
+                moved
+            };
+            if moved {
+                let blocker = self.update_positions_for(&mut tree, gaps);
+                self.push_scrolling_animation(tree, blocker);
+            }
+
+            return MoveResult::Handled;
+        }
 
         // stacks may handle movement internally
         if let FocusedNodeData::Window(window) = data.clone() {
@@ -1551,7 +2230,7 @@ impl TilingLayout {
                     .unwrap();
                     *mapped.tiling_node_id.lock().unwrap() = Some(new_id);
 
-                    let blocker = TilingLayout::update_positions(&self.output, &mut tree, gaps);
+                    let blocker = self.update_positions_for(&mut tree, gaps);
                     self.queue.push_tree(tree, ANIMATION_DURATION, blocker);
                     return MoveResult::ShiftFocus(mapped.into());
                 }
@@ -1627,7 +2306,7 @@ impl TilingLayout {
                     .data_mut()
                     .remove_window(og_idx);
 
-                let blocker = TilingLayout::update_positions(&self.output, &mut tree, gaps);
+                let blocker = self.update_positions_for(&mut tree, gaps);
                 self.queue.push_tree(tree, ANIMATION_DURATION, blocker);
                 return MoveResult::Done;
             }
@@ -1653,7 +2332,7 @@ impl TilingLayout {
                     .data_mut()
                     .remove_window(og_idx);
 
-                let blocker = TilingLayout::update_positions(&self.output, &mut tree, gaps);
+                let blocker = self.update_positions_for(&mut tree, gaps);
                 self.queue.push_tree(tree, ANIMATION_DURATION, blocker);
                 return MoveResult::Done;
             }
@@ -1809,7 +2488,7 @@ impl TilingLayout {
                     MoveResult::Done
                 };
 
-                let blocker = TilingLayout::update_positions(&self.output, &mut tree, gaps);
+                let blocker = self.update_positions_for(&mut tree, gaps);
                 self.queue.push_tree(tree, ANIMATION_DURATION, blocker);
                 return result;
             }
@@ -1852,6 +2531,29 @@ impl TilingLayout {
         };
 
         let (last_node_id, data) = focused;
+
+        if self.tiling_engine == TilingEngine::Scrolling {
+            match direction {
+                FocusDirection::Left
+                | FocusDirection::Right
+                | FocusDirection::Up
+                | FocusDirection::Down => {
+                    return match self.scrolling.next_focus(tree, &last_node_id, direction) {
+                        FocusNavigation::Target(node_id) => {
+                            match tree.get(&node_id).unwrap().data() {
+                                Data::Mapped { mapped, .. } => {
+                                    FocusResult::Some(mapped.clone().into())
+                                }
+                                _ => FocusResult::Handled,
+                            }
+                        }
+                        FocusNavigation::Edge => scrolling_edge_focus_result(direction),
+                        FocusNavigation::Unavailable => FocusResult::Handled,
+                    };
+                }
+                _ => {}
+            }
+        }
 
         if direction == FocusDirection::In {
             if swap_desc
@@ -2124,7 +2826,7 @@ impl TilingLayout {
 
             *orientation = new_orientation;
 
-            let blocker = TilingLayout::update_positions(&self.output, &mut tree, gaps);
+            let blocker = self.update_positions_for(&mut tree, gaps);
             self.queue.push_tree(tree, ANIMATION_DURATION, blocker);
         }
     }
@@ -2244,7 +2946,7 @@ impl TilingLayout {
             }
         };
 
-        let blocker = TilingLayout::update_positions(&self.output, &mut tree, gaps);
+        let blocker = self.update_positions_for(&mut tree, gaps);
         self.queue.push_tree(tree, ANIMATION_DURATION, blocker);
 
         Some(result)
@@ -2321,7 +3023,7 @@ impl TilingLayout {
                         minimize_rect: None,
                     };
 
-                    let blocker = TilingLayout::update_positions(&self.output, &mut tree, gaps);
+                    let blocker = self.update_positions_for(&mut tree, gaps);
                     self.queue.push_tree(tree, ANIMATION_DURATION, blocker);
 
                     return Some(KeyboardFocusTarget::Element(mapped));
@@ -2336,7 +3038,7 @@ impl TilingLayout {
         let gaps = self.gaps();
 
         let mut tree = self.queue.trees.back().unwrap().0.copy_clone();
-        let blocker = TilingLayout::update_positions(&self.output, &mut tree, gaps);
+        let blocker = self.update_positions_for(&mut tree, gaps);
         self.queue.push_tree(tree, ANIMATION_DURATION, blocker);
     }
 
@@ -2362,6 +3064,8 @@ impl TilingLayout {
 
     pub fn update_animation_state(&mut self) -> HashMap<ClientId, Client> {
         let mut clients = HashMap::new();
+        self.queue.update_retired_blocker(&mut clients);
+        self.update_scrolling_live_resize_state();
         let mut ready_trees = 0;
         for (_, _, blocker) in self.queue.trees.iter().skip(1) {
             if let Some(blocker) = blocker.as_ref() {
@@ -2472,6 +3176,163 @@ impl TilingLayout {
         }
 
         edges
+    }
+
+    fn scrolling_focused_tile(&self, seat: &Seat<State>) -> Option<NodeId> {
+        if self.tiling_engine != TilingEngine::Scrolling {
+            return None;
+        }
+        let target = seat.get_keyboard().unwrap().current_focus()?;
+        let (node_id, FocusedNodeData::Window(_)) =
+            TilingLayout::currently_focused_node(self.tree(), target)?
+        else {
+            return None;
+        };
+        self.scrolling.contains(&node_id).then_some(node_id)
+    }
+
+    pub fn scrolling_resize_target(
+        &self,
+        requested: &NodeId,
+        edge: ResizeEdge,
+        seat: &Seat<State>,
+    ) -> Option<ScrollingResizeTarget> {
+        let focused = self.scrolling_focused_tile(seat)?;
+        if requested != &focused {
+            return None;
+        }
+        if edge.contains(ResizeEdge::LEFT) {
+            Some(ScrollingResizeTarget::Column {
+                tile: focused,
+                anchor: ColumnResizeAnchor::Right,
+            })
+        } else if edge.contains(ResizeEdge::RIGHT) {
+            Some(ScrollingResizeTarget::Column {
+                tile: focused,
+                anchor: ColumnResizeAnchor::Left,
+            })
+        } else if edge.contains(ResizeEdge::TOP) {
+            let (upper, lower) = self.scrolling.row_pair(&focused, -1)?;
+            Some(ScrollingResizeTarget::Rows { upper, lower })
+        } else if edge.contains(ResizeEdge::BOTTOM) {
+            let (upper, lower) = self.scrolling.row_pair(&focused, 1)?;
+            Some(ScrollingResizeTarget::Rows { upper, lower })
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn resize_scrolling_column(
+        &mut self,
+        node_id: &NodeId,
+        delta: i32,
+        anchor: ColumnResizeAnchor,
+    ) -> Option<bool> {
+        if self.tiling_engine != TilingEngine::Scrolling {
+            return None;
+        }
+        let mut tree = self.prepare_scrolling_direct_tree();
+        let changed = self
+            .scrolling
+            .resize_column_by_pixels(node_id, delta, anchor)?;
+        if changed {
+            let tiles = self
+                .scrolling
+                .tiles_in_column(node_id)
+                .unwrap_or_else(|| vec![node_id.clone()]);
+            self.set_scrolling_live_resize(
+                &tree,
+                ScrollingResizeTarget::Column {
+                    tile: node_id.clone(),
+                    anchor,
+                },
+                tiles.clone(),
+            );
+            let gaps = self.gaps();
+            let blocker = self.scrolling.update_positions_for_live_resize(
+                &self.output,
+                &mut tree,
+                gaps,
+                &tiles,
+                false,
+            );
+            if let Some(blocker) = blocker {
+                self.queue.retire_blocker(blocker);
+            }
+            self.queue.push_direct_tree(tree, None);
+        }
+        Some(changed)
+    }
+
+    pub(super) fn finish_scrolling_resize(&mut self) {
+        if self.tiling_engine != TilingEngine::Scrolling {
+            return;
+        }
+        let gaps = self.gaps();
+        let mut tree = self.prepare_scrolling_direct_tree();
+        let blocker = if let Some(resize) = self.scrolling_live_resize.clone() {
+            if matches!(resize.target, ScrollingResizeTarget::Column { .. }) {
+                self.scrolling.finish_column_resize();
+            }
+            if let Some(state) = self.scrolling_live_resize.as_mut() {
+                state.finishing = true;
+            }
+            Self::set_scrolling_tiles_resizing(&tree, &resize.tiles, false);
+            self.scrolling.update_positions_for_live_resize(
+                &self.output,
+                &mut tree,
+                gaps,
+                &resize.tiles,
+                true,
+            )
+        } else {
+            // Preserve the prior no-motion behavior, including automatic
+            // centering for a single-column horizontal grab.
+            self.scrolling.finish_column_resize();
+            self.scrolling
+                .update_positions_preserving_viewport(&self.output, &mut tree, gaps)
+        };
+        if let Some(blocker) = blocker {
+            self.queue.retire_blocker(blocker);
+        }
+        self.queue.push_direct_tree(tree, None);
+    }
+
+    pub(super) fn resize_scrolling_rows(
+        &mut self,
+        upper: &NodeId,
+        lower: &NodeId,
+        delta: i32,
+    ) -> Option<bool> {
+        if self.tiling_engine != TilingEngine::Scrolling {
+            return None;
+        }
+        let mut tree = self.prepare_scrolling_direct_tree();
+        let changed = self.scrolling.resize_rows_by_pixels(upper, lower, delta)?;
+        if changed {
+            let tiles = vec![upper.clone(), lower.clone()];
+            self.set_scrolling_live_resize(
+                &tree,
+                ScrollingResizeTarget::Rows {
+                    upper: upper.clone(),
+                    lower: lower.clone(),
+                },
+                tiles.clone(),
+            );
+            let gaps = self.gaps();
+            let blocker = self.scrolling.update_positions_for_live_resize(
+                &self.output,
+                &mut tree,
+                gaps,
+                &tiles,
+                false,
+            );
+            if let Some(blocker) = blocker {
+                self.queue.retire_blocker(blocker);
+            }
+            self.queue.push_direct_tree(tree, None);
+        }
+        Some(changed)
     }
 
     pub fn resize_request(
@@ -2609,7 +3470,7 @@ impl TilingLayout {
                         _ => true,
                     });
             if should_configure {
-                let blocker = TilingLayout::update_positions(&self.output, &mut tree, gaps);
+                let blocker = self.update_positions_for(&mut tree, gaps);
                 self.queue.push_tree(tree, None, blocker);
             }
 
@@ -2630,6 +3491,7 @@ impl TilingLayout {
     }
 
     pub fn cleanup_drag(&mut self) {
+        self.scrolling.cancel_drag();
         let old_tree = &self.queue.trees.back().unwrap().0;
         let mut new_tree = None;
 
@@ -2656,17 +3518,40 @@ impl TilingLayout {
 
             // If anything was changed, push updated tree
             if let Some(mut new_tree) = new_tree {
-                let blocker =
-                    TilingLayout::update_positions(&self.output, &mut new_tree, self.gaps());
-                self.queue.push_tree(new_tree, ANIMATION_DURATION, blocker);
+                let gaps = self.gaps();
+                let blocker = self.update_positions_for(&mut new_tree, gaps);
+                if self.tiling_engine == TilingEngine::Scrolling {
+                    self.queue.push_direct_tree(new_tree, blocker);
+                } else {
+                    self.queue.push_tree(new_tree, ANIMATION_DURATION, blocker);
+                }
             }
         }
     }
 
-    pub fn drop_window(&mut self, window: CosmicMapped) -> (CosmicMapped, Point<i32, Local>) {
+    pub fn drop_window(
+        &mut self,
+        window: CosmicMapped,
+        source_geometry: Rectangle<i32, Local>,
+    ) -> (CosmicMapped, Point<i32, Local>) {
         let gaps = self.gaps();
+        let dropped_window = window.clone();
 
         let mut tree = self.queue.trees.back().unwrap().0.copy_clone();
+        let update_scrolling_model =
+            self.tiling_engine == TilingEngine::Scrolling || self.scrolling.has_pending_drag();
+        let mut column_drop_target = scrolling_drop_target(
+            &tree,
+            self.last_overview_hover.as_ref().map(|(_, zone)| zone),
+        );
+        if self.tiling_engine != TilingEngine::Scrolling
+            && column_drop_target != ColumnDropTarget::Discard
+        {
+            // Classic drops keep their normal tree behavior. If this window
+            // already had persistent scrolling state, only its replaced node
+            // identity is carried across the dormant Classic round trip.
+            column_drop_target = ColumnDropTarget::Original;
+        }
 
         window.output_enter(&self.output, window.bbox());
         {
@@ -2816,8 +3701,34 @@ impl TilingLayout {
             }
         }
 
-        let blocker = TilingLayout::update_positions(&self.output, &mut tree, gaps);
-        self.queue.push_tree(tree, ANIMATION_DURATION, blocker);
+        let final_node_id = mapped.tiling_node_id.lock().unwrap().clone();
+        if self.tiling_engine == TilingEngine::Scrolling
+            && mapped == dropped_window
+            && let Some(final_node_id) = final_node_id.as_ref()
+            && let Ok(node) = tree.get_mut(final_node_id)
+            && let Data::Mapped { minimize_rect, .. } = node.data_mut()
+        {
+            *minimize_rect = Some(source_geometry);
+        }
+        if update_scrolling_model {
+            self.scrolling
+                .finish_drag(final_node_id.as_ref(), column_drop_target);
+        }
+        let blocker = if self.tiling_engine == TilingEngine::Scrolling {
+            self.scrolling.update_positions_ensuring(
+                &self.output,
+                &mut tree,
+                gaps,
+                final_node_id.as_ref(),
+            )
+        } else {
+            self.update_positions_for(&mut tree, gaps)
+        };
+        if self.tiling_engine == TilingEngine::Scrolling {
+            self.push_scrolling_animation(tree, blocker);
+        } else {
+            self.queue.push_tree(tree, ANIMATION_DURATION, blocker);
+        }
 
         let location = self.element_geometry(&mapped).unwrap().loc;
         (mapped, location)
@@ -2991,6 +3902,34 @@ impl TilingLayout {
                 }
             }
             None => false,
+        }
+    }
+
+    #[profiling::function]
+    fn update_positions_for(
+        &mut self,
+        tree: &mut Tree<Data>,
+        gaps: (i32, i32),
+    ) -> Option<TilingBlocker> {
+        TilingLayout::update_positions_with(
+            &self.output,
+            self.tiling_engine,
+            &mut self.scrolling,
+            tree,
+            gaps,
+        )
+    }
+
+    fn update_positions_with(
+        output: &Output,
+        tiling_engine: TilingEngine,
+        scrolling: &mut ScrollingLayout,
+        tree: &mut Tree<Data>,
+        gaps: (i32, i32),
+    ) -> Option<TilingBlocker> {
+        match tiling_engine {
+            TilingEngine::Classic => TilingLayout::update_positions(output, tree, gaps),
+            TilingEngine::Scrolling => scrolling.update_positions(output, tree, gaps),
         }
     }
 
@@ -3345,7 +4284,47 @@ impl TilingLayout {
                             )
                         })
                 }
-                Some((_, Data::Group { .. })) => {
+                Some((id, Data::Group { last_geometry, .. })) => {
+                    if self.tiling_engine == TilingEngine::Scrolling {
+                        let tile = self.scrolling_focused_tile(seat)?;
+                        if let Some((upper, lower, boundary)) =
+                            self.scrolling.row_resize_edge_at(tree, &tile, location_f64)
+                        {
+                            let x = tree.get(&tile).ok()?.data().geometry().loc.x;
+                            return Some((
+                                ResizeForkTarget {
+                                    node: id,
+                                    output: self.output.downgrade(),
+                                    left_up_idx: 0,
+                                    orientation: Orientation::Horizontal,
+                                    scrolling_resize: Some(ScrollingResizeTarget::Rows {
+                                        upper,
+                                        lower,
+                                    }),
+                                }
+                                .into(),
+                                Point::<i32, Local>::from((x, boundary)).to_f64(),
+                            ));
+                        }
+
+                        let (anchor, boundary) =
+                            self.scrolling.resize_edge_at(tree, &tile, location_f64.x)?;
+                        return Some((
+                            ResizeForkTarget {
+                                node: id,
+                                output: self.output.downgrade(),
+                                left_up_idx: 0,
+                                orientation: Orientation::Vertical,
+                                scrolling_resize: Some(ScrollingResizeTarget::Column {
+                                    tile,
+                                    anchor,
+                                }),
+                            }
+                            .into(),
+                            Point::<i32, Local>::from((boundary, last_geometry.loc.y)).to_f64(),
+                        ));
+                    }
+
                     let (id, idx) = fork?;
                     let Data::Group {
                         orientation,
@@ -3361,6 +4340,7 @@ impl TilingLayout {
                             output: self.output.downgrade(),
                             left_up_idx: idx,
                             orientation,
+                            scrolling_resize: None,
                         }
                         .into(),
                         (last_geometry.loc
@@ -3407,8 +4387,18 @@ impl TilingLayout {
                     InsertBehavior::AsRoot,
                 )
                 .unwrap();
-                let blocker = TilingLayout::update_positions(&self.output, &mut tree, gaps);
-                self.queue.push_tree(tree, ANIMATION_DURATION, blocker);
+                let blocker = TilingLayout::update_positions_with(
+                    &self.output,
+                    self.tiling_engine,
+                    &mut self.scrolling,
+                    &mut tree,
+                    gaps,
+                );
+                if self.tiling_engine == TilingEngine::Scrolling {
+                    self.queue.push_direct_tree(tree, blocker);
+                } else {
+                    self.queue.push_tree(tree, ANIMATION_DURATION, blocker);
+                }
             }
             return;
         };
@@ -3875,12 +4865,18 @@ impl TilingLayout {
                                 };
 
                                 if removed || added {
-                                    let blocker = TilingLayout::update_positions(
+                                    let blocker = TilingLayout::update_positions_with(
                                         &self.output,
+                                        self.tiling_engine,
+                                        &mut self.scrolling,
                                         &mut tree,
                                         gaps,
                                     );
-                                    self.queue.push_tree(tree, duration, blocker);
+                                    if self.tiling_engine == TilingEngine::Scrolling {
+                                        self.queue.push_direct_tree(tree, blocker);
+                                    } else {
+                                        self.queue.push_tree(tree, duration, blocker);
+                                    }
                                 }
 
                                 *instant = None;
@@ -3978,7 +4974,7 @@ impl TilingLayout {
         };
         TilingLayout::merge_trees(src, &mut dst, orientation);
 
-        let blocker = TilingLayout::update_positions(&self.output, &mut dst, gaps);
+        let blocker = self.update_positions_for(&mut dst, gaps);
         self.queue.push_tree(dst, ANIMATION_DURATION, blocker);
     }
 
@@ -4042,6 +5038,12 @@ impl TilingLayout {
         CosmicStackRenderElement<R>: RenderElement<R>,
     {
         let output_scale = self.output.current_scale().fractional_scale();
+        let live_resize_tiles = self
+            .scrolling_live_resize
+            .as_ref()
+            .filter(|_| self.tiling_engine == TilingEngine::Scrolling)
+            .map(|resize| resize.tiles.clone())
+            .unwrap_or_default();
 
         let (target_tree, duration, _) = if self.queue.animation_start.is_some() {
             self.queue
@@ -4159,6 +5161,7 @@ impl TilingLayout {
             geometries,
             old_geometries,
             is_overview,
+            self.tiling_engine == TilingEngine::Scrolling,
             seat,
             focused,
             &self.output,
@@ -4177,6 +5180,7 @@ impl TilingLayout {
             overview,
             resize_indicator,
             swap_desc.clone(),
+            &live_resize_tiles,
             &self.swapping_stack_surface_id,
             &self.backdrop_id,
             theme,
@@ -4224,9 +5228,13 @@ impl TilingLayout {
             .then(|| &self.queue.trees.front().unwrap().0);
 
         let percentage = if let Some(animation_start) = self.queue.animation_start {
-            let percentage = Instant::now().duration_since(animation_start).as_millis() as f32
-                / duration.as_millis() as f32;
-            ease(EaseInOutCubic, 0.0, 1.0, percentage)
+            if *duration == Duration::ZERO {
+                1.0
+            } else {
+                let percentage = Instant::now().duration_since(animation_start).as_millis() as f32
+                    / duration.as_millis() as f32;
+                ease(EaseInOutCubic, 0.0, 1.0, percentage)
+            }
         } else {
             1.0
         };
@@ -5296,6 +6304,7 @@ fn render_new_tree_windows<R>(
     geometries: Option<HashMap<NodeId, Rectangle<i32, Local>>>,
     old_geometries: Option<HashMap<NodeId, Rectangle<i32, Local>>>,
     is_overview: bool,
+    is_scrolling: bool,
     seat: Option<&Seat<State>>,
     focused: Option<&CosmicMapped>,
     output: &Output,
@@ -5305,6 +6314,7 @@ fn render_new_tree_windows<R>(
     overview: (OverviewMode, Option<(SwapIndicator, Option<&Tree<Data>>)>),
     mut resize_indicator: Option<(ResizeMode, ResizeIndicator)>,
     swap_desc: Option<NodeDesc>,
+    live_resize_tiles: &[NodeId],
     swapping_stack_surface_id: &Id,
     backdrop_id: &Id,
     theme: &cosmic::theme::CosmicTheme,
@@ -5616,29 +6626,32 @@ fn render_new_tree_windows<R>(
             }
 
             if let Data::Mapped { mapped, .. } = data {
-                let elem_geometry = mapped.geometry().to_physical_precise_round(output_scale);
+                let committed_geometry = mapped.geometry();
+                let elem_geometry = committed_geometry.to_physical_precise_round(output_scale);
 
                 let scale = geo.size.to_f64() / original_geo.size.to_f64();
-                // In overview mode, don't pass max_size to avoid pre-clipping.
-                // Let constrain_render_elements handle scaling instead.
-                let max_size = if is_overview {
-                    None
-                } else {
-                    Some(geo.size.as_logical())
-                };
-                let shadow_element = mapped.shadow_render_element(
-                    renderer,
-                    geo.loc.as_logical().to_physical_precise_round(output_scale)
-                        - elem_geometry.loc,
-                    max_size,
-                    Scale::from(output_scale),
-                    scale.x.min(scale.y),
-                    alpha,
+                let constrain_animated_width = tiled_window_has_animated_width(
+                    is_scrolling,
+                    is_overview,
+                    animating,
+                    &geo,
+                    original_geo,
+                );
+                let constrain_live_resize = !is_overview && live_resize_tiles.contains(&node_id);
+                let constrain_from_source = constrain_animated_width || constrain_live_resize;
+                let max_size = tiled_window_render_max_size(
+                    is_scrolling,
+                    is_overview,
+                    animating,
+                    constrain_live_resize,
+                    &geo,
+                    original_geo,
+                    committed_geometry.size.as_logical(),
                 );
 
                 let (behavior, align) = if is_overview {
                     (ConstrainScaleBehavior::Fit, ConstrainAlign::CENTER)
-                } else if animating {
+                } else if animating || constrain_live_resize {
                     (ConstrainScaleBehavior::Stretch, ConstrainAlign::TOP_LEFT)
                 } else {
                     (ConstrainScaleBehavior::CutOff, ConstrainAlign::TOP_LEFT)
@@ -5682,6 +6695,30 @@ fn render_new_tree_windows<R>(
                     .next()
                     .map(CosmicMappedRenderElement::TiledOverlay),
                     x => Some(x),
+                };
+
+                // Scrolling width animations generate elements at the target
+                // size and constrain them exactly once to `geo`. Generating
+                // borders or shadows at `geo` before stretching them from the
+                // target geometry applies the width interpolation twice and
+                // leaves a target-like edge inside the window.
+                let shadow_element = mapped.shadow_render_element(
+                    renderer,
+                    geo.loc.as_logical().to_physical_precise_round(output_scale)
+                        - elem_geometry.loc,
+                    max_size,
+                    Scale::from(output_scale),
+                    if constrain_from_source {
+                        1.0
+                    } else {
+                        scale.x.min(scale.y)
+                    },
+                    alpha,
+                );
+                let shadow_element = if constrain_from_source {
+                    shadow_element.and_then(&map_elem)
+                } else {
+                    shadow_element
                 };
 
                 let mut upper_elements = SmallVec::<[CosmicMappedRenderElement<R>; 4]>::new_const();
@@ -5784,6 +6821,50 @@ fn render_new_tree_windows<R>(
     {
         push(elem);
     }
+}
+
+fn tiled_window_render_max_size(
+    is_scrolling: bool,
+    is_overview: bool,
+    animating: bool,
+    live_resize: bool,
+    animated_geometry: &Rectangle<i32, Local>,
+    target_geometry: &Rectangle<i32, Local>,
+    committed_size: Size<i32, Logical>,
+) -> Option<Size<i32, Logical>> {
+    if is_overview {
+        None
+    } else if live_resize {
+        Some(committed_size)
+    } else if tiled_window_has_animated_width(
+        is_scrolling,
+        is_overview,
+        animating,
+        animated_geometry,
+        target_geometry,
+    ) {
+        Some(target_geometry.size.as_logical())
+    } else {
+        Some(animated_geometry.size.as_logical())
+    }
+}
+
+fn live_resize_tile_is_pending(latest_size_committed: bool, resizing: bool) -> bool {
+    !latest_size_committed || resizing
+}
+
+fn tiled_window_has_animated_width(
+    is_scrolling: bool,
+    is_overview: bool,
+    animating: bool,
+    animated_geometry: &Rectangle<i32, Local>,
+    target_geometry: &Rectangle<i32, Local>,
+) -> bool {
+    is_scrolling
+        && !is_overview
+        && animating
+        && animated_geometry.size.w != target_geometry.size.w
+        && animated_geometry.size.h == target_geometry.size.h
 }
 
 fn render_new_tree(
@@ -5954,5 +7035,1591 @@ fn scale_to_center<C>(
             )
                 .into(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use smithay::output::{Mode, PhysicalProperties, Subpixel};
+
+    fn test_output() -> Output {
+        Output::new(
+            "tiling-test".into(),
+            PhysicalProperties {
+                size: (0, 0).into(),
+                subpixel: Subpixel::Unknown,
+                make: "COSMIC".into(),
+                model: "test".into(),
+                serial_number: "test".into(),
+            },
+        )
+    }
+
+    fn empty_layout(tiling_engine: TilingEngine) -> TilingLayout {
+        TilingLayout::new(
+            cosmic::Theme::default(),
+            AppearanceConfig::default(),
+            &test_output(),
+            tiling_engine,
+        )
+    }
+
+    fn sized_scrolling_layout() -> TilingLayout {
+        let output = test_output();
+        output.change_current_state(
+            Some(Mode {
+                size: (1_200, 800).into(),
+                refresh: 60_000,
+            }),
+            None,
+            None,
+            Some((0, 0).into()),
+        );
+        TilingLayout::new(
+            cosmic::Theme::default(),
+            AppearanceConfig::default(),
+            &output,
+            TilingEngine::Scrolling,
+        )
+    }
+
+    #[test]
+    fn empty_layout_uses_requested_engine() {
+        assert_eq!(
+            empty_layout(TilingEngine::Classic).mode(),
+            TilingEngine::Classic
+        );
+        assert_eq!(
+            empty_layout(TilingEngine::Scrolling).mode(),
+            TilingEngine::Scrolling
+        );
+    }
+
+    #[test]
+    fn confirmed_new_toplevel_is_reconciled_after_the_focused_scrolling_column() {
+        let geometry = Rectangle::new((0, 0).into(), (1_200, 800).into());
+        let mut layout = sized_scrolling_layout();
+        let mut tree = Tree::new();
+        let root = tree
+            .insert(
+                Node::new(Data::Group {
+                    orientation: Orientation::Vertical,
+                    sizes: vec![400; 3],
+                    last_geometry: geometry,
+                    alive: Arc::new(()),
+                    pill_indicator: None,
+                }),
+                InsertBehavior::AsRoot,
+            )
+            .unwrap();
+        let insert = |tree: &mut Tree<Data>| {
+            tree.insert(
+                Node::new(Data::Placeholder {
+                    id: Id::new(),
+                    last_geometry: geometry,
+                    type_: PlaceholderType::GrabbedWindow,
+                }),
+                InsertBehavior::UnderNode(&root),
+            )
+            .unwrap()
+        };
+        let first = insert(&mut tree);
+        let second = insert(&mut tree);
+        let third = insert(&mut tree);
+        layout.update_positions_for(&mut tree, layout.gaps());
+
+        assert!(layout.scrolling.begin_drag(&second));
+        layout
+            .scrolling
+            .finish_drag(Some(&second), ColumnDropTarget::Above(first.clone()));
+        assert_eq!(
+            layout.scrolling.column_tiles(),
+            [vec![second.clone(), first.clone()], vec![third.clone()]]
+        );
+
+        if let Data::Group { sizes, .. } = tree.get_mut(&root).unwrap().data_mut() {
+            sizes.push(400);
+        }
+        let new = insert(&mut tree);
+        layout
+            .scrolling
+            .insert_new_toplevel(new.clone(), Some(&first));
+        layout.update_positions_for(&mut tree, layout.gaps());
+
+        assert_eq!(
+            layout.scrolling.column_tiles(),
+            [vec![second, first], vec![new], vec![third]]
+        );
+        assert_eq!(
+            layout.scrolling.column_width_fractions(),
+            [0.66, 0.66, 0.66]
+        );
+    }
+
+    #[test]
+    fn direct_geometry_updates_coalesce_before_presentation() {
+        let mut layout = empty_layout(TilingEngine::Scrolling);
+        let first = Tree::new();
+        let second = Tree::new();
+
+        layout
+            .queue
+            .push_direct_tree(first, Some(TilingBlocker::new(std::iter::empty())));
+        layout
+            .queue
+            .push_direct_tree(second, Some(TilingBlocker::new(std::iter::empty())));
+
+        assert_eq!(layout.queue.trees.len(), 2);
+        assert_eq!(layout.queue.trees.back().unwrap().1, Duration::ZERO);
+        assert!(layout.queue.trees.back().unwrap().2.is_some());
+        assert!(layout.queue.retired_blocker.is_some());
+    }
+
+    #[test]
+    fn scrolling_animations_retarget_from_current_visual_geometry() {
+        let source_geometry = Rectangle::new((0, 0).into(), (600, 800).into());
+        let mut source = Tree::new();
+        let tile = source
+            .insert(
+                Node::new(Data::Placeholder {
+                    id: Id::new(),
+                    last_geometry: source_geometry,
+                    type_: PlaceholderType::GrabbedWindow,
+                }),
+                InsertBehavior::AsRoot,
+            )
+            .unwrap();
+        let mut target = source.copy_clone();
+        target
+            .get_mut(&tile)
+            .unwrap()
+            .data_mut()
+            .update_geometry(Rectangle::new((100, 0).into(), (600, 800).into()));
+
+        let mut queue = TreeQueue::default();
+        queue.push_tree(source, Duration::ZERO, None);
+        queue.push_retargetable_tree(target, ANIMATION_DURATION, None);
+        queue.animation_start = Some(Instant::now() - ANIMATION_DURATION / 2);
+
+        let mut final_target = queue.trees.back().unwrap().0.copy_clone();
+        final_target
+            .get_mut(&tile)
+            .unwrap()
+            .data_mut()
+            .update_geometry(Rectangle::new((200, 0).into(), (600, 800).into()));
+        queue.push_retargetable_tree(final_target, ANIMATION_DURATION, None);
+
+        assert_eq!(queue.trees.len(), 2);
+        assert_eq!(queue.trees.back().unwrap().1, ANIMATION_DURATION);
+        let current_x = queue
+            .trees
+            .front()
+            .unwrap()
+            .0
+            .get(&tile)
+            .unwrap()
+            .data()
+            .geometry()
+            .loc
+            .x;
+        assert!((0..=100).contains(&current_x));
+        assert_eq!(
+            queue
+                .trees
+                .back()
+                .unwrap()
+                .0
+                .get(&tile)
+                .unwrap()
+                .data()
+                .geometry()
+                .loc
+                .x,
+            200
+        );
+    }
+
+    #[test]
+    fn animated_tiled_elements_are_constrained_once_from_target_geometry() {
+        let widening_target = Rectangle::new((0, 0).into(), (1_000, 390).into());
+        let widening_frame = Rectangle::new((0, 0).into(), (830, 390).into());
+        let widening_source = tiled_window_render_max_size(
+            true,
+            false,
+            true,
+            false,
+            &widening_frame,
+            &widening_target,
+            widening_target.size.as_logical(),
+        )
+        .unwrap();
+        assert_eq!(widening_source, widening_target.size.as_logical());
+        assert_eq!(
+            (f64::from(widening_source.w) * f64::from(widening_frame.size.w)
+                / f64::from(widening_target.size.w))
+            .round() as i32,
+            widening_frame.size.w
+        );
+
+        let narrowing_target = Rectangle::new((0, 0).into(), (660, 390).into());
+        let narrowing_frame = Rectangle::new((0, 0).into(), (830, 390).into());
+        let narrowing_source = tiled_window_render_max_size(
+            true,
+            false,
+            true,
+            false,
+            &narrowing_frame,
+            &narrowing_target,
+            narrowing_target.size.as_logical(),
+        )
+        .unwrap();
+        assert_eq!(narrowing_source, narrowing_target.size.as_logical());
+        assert_eq!(
+            (f64::from(narrowing_source.w) * f64::from(narrowing_frame.size.w)
+                / f64::from(narrowing_target.size.w))
+            .round() as i32,
+            narrowing_frame.size.w
+        );
+        assert_eq!(narrowing_source.h, narrowing_frame.size.h);
+
+        assert_eq!(
+            tiled_window_render_max_size(
+                true,
+                false,
+                false,
+                false,
+                &widening_frame,
+                &widening_target,
+                widening_target.size.as_logical(),
+            ),
+            Some(widening_frame.size.as_logical())
+        );
+        assert_eq!(
+            tiled_window_render_max_size(
+                true,
+                true,
+                true,
+                false,
+                &widening_frame,
+                &widening_target,
+                widening_target.size.as_logical(),
+            ),
+            None
+        );
+
+        let vertical_frame = Rectangle::new((0, 0).into(), (1_000, 300).into());
+        assert_eq!(
+            tiled_window_render_max_size(
+                true,
+                false,
+                true,
+                false,
+                &vertical_frame,
+                &widening_target,
+                widening_target.size.as_logical(),
+            ),
+            Some(vertical_frame.size.as_logical())
+        );
+        assert!(!tiled_window_has_animated_width(
+            true,
+            false,
+            true,
+            &vertical_frame,
+            &widening_target
+        ));
+    }
+
+    #[test]
+    fn classic_width_animations_preserve_the_upstream_constraint_source() {
+        // Match the fork-point's Some(geo.size) and unconstrained shadow for
+        // both widening and narrowing, while retaining Scrolling's single
+        // interpolation from the target geometry.
+        let frame = Rectangle::new((50, 0).into(), (830, 390).into());
+        for width in [1_000, 660] {
+            let target = Rectangle::new((0, 0).into(), (width, 390).into());
+            for is_scrolling in [false, true] {
+                assert_eq!(
+                    tiled_window_has_animated_width(is_scrolling, false, true, &frame, &target),
+                    is_scrolling,
+                );
+                assert_eq!(
+                    tiled_window_render_max_size(
+                        is_scrolling,
+                        false,
+                        true,
+                        false,
+                        &frame,
+                        &target,
+                        target.size.as_logical(),
+                    ),
+                    Some(if is_scrolling {
+                        target.size.as_logical()
+                    } else {
+                        frame.size.as_logical()
+                    }),
+                );
+                // Neither overview nor a steady frame may take this path.
+                assert!(!tiled_window_has_animated_width(
+                    is_scrolling,
+                    true,
+                    true,
+                    &frame,
+                    &target
+                ));
+                assert!(!tiled_window_has_animated_width(
+                    is_scrolling,
+                    false,
+                    false,
+                    &frame,
+                    &target
+                ));
+                assert_eq!(
+                    tiled_window_render_max_size(
+                        is_scrolling,
+                        true,
+                        true,
+                        false,
+                        &frame,
+                        &target,
+                        target.size.as_logical(),
+                    ),
+                    None,
+                );
+                assert_eq!(
+                    tiled_window_render_max_size(
+                        is_scrolling,
+                        false,
+                        false,
+                        false,
+                        &frame,
+                        &target,
+                        target.size.as_logical(),
+                    ),
+                    Some(frame.size.as_logical()),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn live_resize_uses_the_committed_buffer_as_its_single_constraint_source() {
+        let widening_tile = Rectangle::new((100, 0).into(), (900, 390).into());
+        let narrowing_tile = Rectangle::new((100, 0).into(), (500, 390).into());
+        let committed = Size::from((660, 390));
+
+        for tile in [widening_tile, narrowing_tile] {
+            let source =
+                tiled_window_render_max_size(true, false, false, true, &tile, &tile, committed)
+                    .unwrap();
+            assert_eq!(source, committed);
+
+            // The committed content is stretched or clipped exactly once to
+            // the current tile, so its resulting edge is the tile edge.
+            let visible_width =
+                (f64::from(source.w) * f64::from(tile.size.w) / f64::from(source.w)).round() as i32;
+            assert_eq!(visible_width, tile.size.w);
+            assert_eq!(
+                tile.loc.x.saturating_add(visible_width),
+                tile.loc.x + tile.size.w
+            );
+        }
+
+        let taller_upper = Rectangle::new((100, 0).into(), (660, 500).into());
+        let shorter_lower = Rectangle::new((100, 510).into(), (660, 280).into());
+        for tile in [taller_upper, shorter_lower] {
+            let source =
+                tiled_window_render_max_size(true, false, false, true, &tile, &tile, committed)
+                    .unwrap();
+            assert_eq!(source, committed);
+            let visible_height =
+                (f64::from(source.h) * f64::from(tile.size.h) / f64::from(source.h)).round() as i32;
+            assert_eq!(visible_height, tile.size.h);
+            assert_eq!(
+                tile.loc.y.saturating_add(visible_height),
+                tile.loc.y + tile.size.h
+            );
+        }
+
+        assert_eq!(
+            tiled_window_render_max_size(
+                true,
+                true,
+                false,
+                true,
+                &widening_tile,
+                &widening_tile,
+                committed,
+            ),
+            None
+        );
+
+        assert!(live_resize_tile_is_pending(false, true));
+        assert!(live_resize_tile_is_pending(true, true));
+        assert!(!live_resize_tile_is_pending(true, false));
+    }
+
+    #[test]
+    fn repeated_scrolling_animations_remain_bounded_and_preserve_blockers() {
+        let mut queue = TreeQueue::default();
+        queue.push_tree(Tree::new(), Duration::ZERO, None);
+        queue.push_retargetable_tree(
+            Tree::new(),
+            ANIMATION_DURATION,
+            Some(TilingBlocker::new(std::iter::empty())),
+        );
+
+        for _ in 0..32 {
+            queue.push_retargetable_tree(Tree::new(), ANIMATION_DURATION, None);
+            assert_eq!(queue.trees.len(), 2);
+        }
+
+        assert!(queue.retired_blocker.is_some());
+        assert_eq!(queue.trees.back().unwrap().1, ANIMATION_DURATION);
+    }
+
+    #[test]
+    fn direct_input_interrupts_scrolling_animation_and_stays_immediate() {
+        let mut queue = TreeQueue::default();
+        queue.push_tree(Tree::new(), Duration::ZERO, None);
+        queue.push_retargetable_tree(Tree::new(), ANIMATION_DURATION, None);
+        queue.animation_start = Some(Instant::now());
+
+        let direct = queue.prepare_direct_tree();
+        queue.push_direct_tree(direct, None);
+
+        assert!(queue.animation_start.is_none());
+        assert_eq!(queue.trees.len(), 2);
+        assert_eq!(queue.trees.back().unwrap().1, Duration::ZERO);
+    }
+
+    #[test]
+    fn scrolling_focus_and_center_viewport_changes_are_animated() {
+        let geometry = Rectangle::new((0, 0).into(), (1_200, 800).into());
+        let mut layout = sized_scrolling_layout();
+        let mut tree = Tree::new();
+        let root = tree
+            .insert(
+                Node::new(Data::Group {
+                    orientation: Orientation::Vertical,
+                    sizes: vec![400, 400, 400],
+                    last_geometry: geometry,
+                    alive: Arc::new(()),
+                    pill_indicator: None,
+                }),
+                InsertBehavior::AsRoot,
+            )
+            .unwrap();
+        let insert = |tree: &mut Tree<Data>| {
+            tree.insert(
+                Node::new(Data::Placeholder {
+                    id: Id::new(),
+                    last_geometry: geometry,
+                    type_: PlaceholderType::GrabbedWindow,
+                }),
+                InsertBehavior::UnderNode(&root),
+            )
+            .unwrap()
+        };
+        let first = insert(&mut tree);
+        let _second = insert(&mut tree);
+        let third = insert(&mut tree);
+        let blocker = layout.update_positions_for(&mut tree, layout.gaps());
+        layout.queue.trees.clear();
+        layout.queue.push_tree(tree, Duration::ZERO, blocker);
+
+        assert!(!layout.scrolling.ensure_visible(&first));
+        assert_eq!(layout.queue.trees.len(), 1);
+        assert!(layout.scrolling.ensure_visible(&third));
+        let mut focused = layout.tree().copy_clone();
+        let blocker = layout.scrolling.update_positions_ensuring(
+            &layout.output,
+            &mut focused,
+            layout.gaps(),
+            Some(&third),
+        );
+        layout.push_scrolling_animation(focused, blocker);
+        assert_eq!(layout.queue.trees.back().unwrap().1, ANIMATION_DURATION);
+
+        assert!(layout.scrolling.request_center(&third));
+        let mut centered = layout.tree().copy_clone();
+        let blocker = layout.update_positions_for(&mut centered, layout.gaps());
+        layout.push_scrolling_animation(centered, blocker);
+        assert_eq!(layout.queue.trees.len(), 2);
+        assert_eq!(layout.queue.trees.back().unwrap().1, ANIMATION_DURATION);
+    }
+
+    #[test]
+    fn scrolling_vertical_focus_edges_allow_workspace_fallback() {
+        assert!(matches!(
+            scrolling_edge_focus_result(FocusDirection::Up),
+            FocusResult::None
+        ));
+        assert!(matches!(
+            scrolling_edge_focus_result(FocusDirection::Down),
+            FocusResult::None
+        ));
+        assert!(matches!(
+            scrolling_edge_focus_result(FocusDirection::Left),
+            FocusResult::Handled
+        ));
+        assert!(matches!(
+            scrolling_edge_focus_result(FocusDirection::Right),
+            FocusResult::Handled
+        ));
+    }
+
+    #[test]
+    fn empty_layout_mode_transition_replaces_pending_queue_state() {
+        let mut layout = empty_layout(TilingEngine::Classic);
+        let mut transient_tree = Tree::new();
+        transient_tree
+            .insert(
+                Node::new(Data::Placeholder {
+                    id: Id::new(),
+                    last_geometry: Rectangle::from_size((100, 100).into()),
+                    type_: PlaceholderType::DropZone,
+                }),
+                InsertBehavior::AsRoot,
+            )
+            .unwrap();
+        layout
+            .queue
+            .push_tree(transient_tree, ANIMATION_DURATION, None);
+        layout.queue.animation_start = Some(Instant::now());
+        layout.last_overview_hover = Some((None, TargetZone::Initial));
+
+        layout.set_mode(TilingEngine::Scrolling);
+
+        assert_eq!(layout.mode(), TilingEngine::Scrolling);
+        assert_eq!(layout.queue.trees.len(), 1);
+        assert_eq!(layout.queue.trees.front().unwrap().1, Duration::ZERO);
+        assert!(layout.queue.trees.front().unwrap().2.is_none());
+        assert!(layout.queue.animation_start.is_none());
+        assert!(layout.last_overview_hover.is_none());
+        assert!(layout.tree().root_node_id().is_none());
+
+        layout.set_mode(TilingEngine::Classic);
+        assert_eq!(layout.mode(), TilingEngine::Classic);
+        assert_eq!(layout.queue.trees.len(), 1);
+        assert!(layout.tree().root_node_id().is_none());
+    }
+
+    #[test]
+    fn mode_transition_keeps_grabbed_window_placeholder() {
+        let mut layout = empty_layout(TilingEngine::Classic);
+        let mut grabbed_tree = Tree::new();
+        let grabbed = grabbed_tree
+            .insert(
+                Node::new(Data::Placeholder {
+                    id: Id::new(),
+                    last_geometry: Rectangle::from_size((100, 100).into()),
+                    type_: PlaceholderType::GrabbedWindow,
+                }),
+                InsertBehavior::AsRoot,
+            )
+            .unwrap();
+        layout.queue.push_tree(grabbed_tree, Duration::ZERO, None);
+
+        layout.set_mode(TilingEngine::Scrolling);
+
+        assert_eq!(layout.tree().root_node_id(), Some(&grabbed));
+        assert!(matches!(
+            layout.last_overview_hover,
+            Some((None, TargetZone::InitialPlaceholder(ref node_id))) if node_id == &grabbed
+        ));
+        assert_eq!(
+            layout
+                .scrolling
+                .next_focus(layout.tree(), &grabbed, FocusDirection::Left),
+            FocusNavigation::Edge
+        );
+        let Data::Placeholder { last_geometry, .. } = layout.tree().get(&grabbed).unwrap().data()
+        else {
+            unreachable!()
+        };
+        assert_ne!(*last_geometry, Rectangle::from_size((100, 100).into()));
+
+        layout.set_mode(TilingEngine::Classic);
+        assert_eq!(layout.mode(), TilingEngine::Classic);
+        assert_eq!(layout.tree().root_node_id(), Some(&grabbed));
+    }
+
+    #[test]
+    fn non_empty_round_trip_preserves_nodes_and_scrolling_order() {
+        let geometry = Rectangle::new((0, 0).into(), (1_200, 800).into());
+        let mut layout = empty_layout(TilingEngine::Scrolling);
+        let mut tree = Tree::new();
+        let root = tree
+            .insert(
+                Node::new(Data::Group {
+                    orientation: Orientation::Vertical,
+                    sizes: vec![400, 400, 400],
+                    last_geometry: geometry,
+                    alive: Arc::new(()),
+                    pill_indicator: None,
+                }),
+                InsertBehavior::AsRoot,
+            )
+            .unwrap();
+        let insert_column = |tree: &mut Tree<Data>| {
+            tree.insert(
+                Node::new(Data::Placeholder {
+                    id: Id::new(),
+                    last_geometry: geometry,
+                    type_: PlaceholderType::GrabbedWindow,
+                }),
+                InsertBehavior::UnderNode(&root),
+            )
+            .unwrap()
+        };
+        let first = insert_column(&mut tree);
+        let second = insert_column(&mut tree);
+        let third = insert_column(&mut tree);
+        let blocker = layout.update_positions_for(&mut tree, layout.gaps());
+        layout.queue.trees.clear();
+        layout.queue.push_tree(tree, Duration::ZERO, blocker);
+
+        assert!(layout.scrolling.move_column(&second, Direction::Right));
+        assert_eq!(
+            layout.scrolling.column_order(),
+            vec![first.clone(), third.clone(), second.clone()]
+        );
+        let initial_preorder = layout
+            .tree()
+            .traverse_pre_order_ids(&root)
+            .unwrap()
+            .collect::<Vec<_>>();
+
+        layout.set_mode(TilingEngine::Classic);
+
+        let mut classic_tree = layout.tree().copy_clone();
+        let fourth = insert_column(&mut classic_tree);
+        classic_tree
+            .get_mut(&root)
+            .unwrap()
+            .data_mut()
+            .add_window(3);
+        let blocker = layout.update_positions_for(&mut classic_tree, layout.gaps());
+        layout
+            .queue
+            .push_tree(classic_tree, Duration::ZERO, blocker);
+        layout.set_mode(TilingEngine::Scrolling);
+
+        let final_preorder = layout
+            .tree()
+            .traverse_pre_order_ids(&root)
+            .unwrap()
+            .collect::<Vec<_>>();
+        assert_eq!(&final_preorder[..initial_preorder.len()], initial_preorder);
+        assert_eq!(final_preorder.last(), Some(&fourth));
+        assert_eq!(
+            layout.scrolling.column_order(),
+            vec![first, third, second, fourth]
+        );
+    }
+
+    #[test]
+    fn scrolling_pointer_drop_commits_preview_node_replacement_at_target() {
+        let geometry = Rectangle::new((0, 0).into(), (1_200, 800).into());
+        let mut layout = empty_layout(TilingEngine::Scrolling);
+        let mut tree = Tree::new();
+        let root = tree
+            .insert(
+                Node::new(Data::Group {
+                    orientation: Orientation::Vertical,
+                    sizes: vec![400, 400, 400],
+                    last_geometry: geometry,
+                    alive: Arc::new(()),
+                    pill_indicator: None,
+                }),
+                InsertBehavior::AsRoot,
+            )
+            .unwrap();
+        let insert_column = |tree: &mut Tree<Data>| {
+            tree.insert(
+                Node::new(Data::Placeholder {
+                    id: Id::new(),
+                    last_geometry: geometry,
+                    type_: PlaceholderType::GrabbedWindow,
+                }),
+                InsertBehavior::UnderNode(&root),
+            )
+            .unwrap()
+        };
+        let first = insert_column(&mut tree);
+        let second = insert_column(&mut tree);
+        let third = insert_column(&mut tree);
+        let blocker = layout.update_positions_for(&mut tree, layout.gaps());
+        layout.queue.trees.clear();
+        layout.queue.push_tree(tree, Duration::ZERO, blocker);
+
+        assert!(layout.scrolling.begin_drag(&third));
+        let mut preview = layout.tree().copy_clone();
+        TilingLayout::unmap_internal(&mut preview, &third);
+        let blocker = layout.update_positions_for(&mut preview, layout.gaps());
+        layout.queue.trees.clear();
+        layout.queue.push_tree(preview, Duration::ZERO, blocker);
+        assert_eq!(
+            layout.scrolling.column_order(),
+            vec![first.clone(), second.clone()]
+        );
+
+        let mut dropped = layout.tree().copy_clone();
+        let replacement = insert_column(&mut dropped);
+        dropped.get_mut(&root).unwrap().data_mut().add_window(1);
+        dropped.make_nth_sibling(&replacement, 1).unwrap();
+        let target = scrolling_drop_target(
+            &dropped,
+            Some(&TargetZone::WindowSplit(second.clone(), Direction::Left)),
+        );
+        assert_eq!(target, ColumnDropTarget::Before(second.clone()));
+        assert_eq!(
+            scrolling_drop_target(
+                &dropped,
+                Some(&TargetZone::GroupEdge(root.clone(), Direction::Left)),
+            ),
+            ColumnDropTarget::Before(first.clone())
+        );
+        assert_eq!(
+            scrolling_drop_target(&dropped, Some(&TargetZone::GroupInterior(root.clone(), 0)),),
+            ColumnDropTarget::After(first.clone())
+        );
+
+        layout.scrolling.finish_drag(Some(&replacement), target);
+        let blocker = layout.update_positions_for(&mut dropped, layout.gaps());
+        layout.push_scrolling_animation(dropped, blocker);
+        assert_eq!(layout.queue.trees.back().unwrap().1, ANIMATION_DURATION);
+
+        assert_eq!(
+            layout.scrolling.column_order(),
+            vec![first, replacement, second]
+        );
+    }
+
+    #[test]
+    fn scrolling_pointer_drop_inserts_replacement_above_target_tile() {
+        let geometry = Rectangle::new((0, 0).into(), (1_200, 800).into());
+        let mut layout = empty_layout(TilingEngine::Scrolling);
+        let mut tree = Tree::new();
+        let root = tree
+            .insert(
+                Node::new(Data::Group {
+                    orientation: Orientation::Vertical,
+                    sizes: vec![400, 400, 400],
+                    last_geometry: geometry,
+                    alive: Arc::new(()),
+                    pill_indicator: None,
+                }),
+                InsertBehavior::AsRoot,
+            )
+            .unwrap();
+        let insert_tile = |tree: &mut Tree<Data>| {
+            tree.insert(
+                Node::new(Data::Placeholder {
+                    id: Id::new(),
+                    last_geometry: geometry,
+                    type_: PlaceholderType::GrabbedWindow,
+                }),
+                InsertBehavior::UnderNode(&root),
+            )
+            .unwrap()
+        };
+        let first = insert_tile(&mut tree);
+        let second = insert_tile(&mut tree);
+        let third = insert_tile(&mut tree);
+        let blocker = layout.update_positions_for(&mut tree, layout.gaps());
+        layout.queue.trees.clear();
+        layout.queue.push_tree(tree, Duration::ZERO, blocker);
+
+        assert!(layout.scrolling.begin_drag(&third));
+        let mut preview = layout.tree().copy_clone();
+        TilingLayout::unmap_internal(&mut preview, &third);
+        let blocker = layout.update_positions_for(&mut preview, layout.gaps());
+        layout.queue.trees.clear();
+        layout.queue.push_tree(preview, Duration::ZERO, blocker);
+
+        let mut dropped = layout.tree().copy_clone();
+        let replacement = insert_tile(&mut dropped);
+        let target = scrolling_drop_target(
+            &dropped,
+            Some(&TargetZone::WindowSplit(second.clone(), Direction::Up)),
+        );
+        assert_eq!(target, ColumnDropTarget::Above(second.clone()));
+        assert_eq!(
+            scrolling_drop_target(
+                &dropped,
+                Some(&TargetZone::WindowSplit(second.clone(), Direction::Down)),
+            ),
+            ColumnDropTarget::Below(second.clone())
+        );
+
+        layout.scrolling.finish_drag(Some(&replacement), target);
+        let blocker = layout.update_positions_for(&mut dropped, layout.gaps());
+        layout.push_scrolling_animation(dropped, blocker);
+        assert_eq!(layout.queue.trees.back().unwrap().1, ANIMATION_DURATION);
+
+        assert_eq!(
+            layout.scrolling.column_tiles(),
+            vec![vec![first], vec![replacement, second]]
+        );
+    }
+
+    #[test]
+    fn scrolling_directional_focus_never_targets_grabbed_placeholders() {
+        let geometry = Rectangle::new((0, 0).into(), (1_200, 800).into());
+        let mut layout = empty_layout(TilingEngine::Scrolling);
+        let mut tree = Tree::new();
+        let root = tree
+            .insert(
+                Node::new(Data::Group {
+                    orientation: Orientation::Vertical,
+                    sizes: vec![600, 600],
+                    last_geometry: geometry,
+                    alive: Arc::new(()),
+                    pill_indicator: None,
+                }),
+                InsertBehavior::AsRoot,
+            )
+            .unwrap();
+        let insert_placeholder = |tree: &mut Tree<Data>| {
+            tree.insert(
+                Node::new(Data::Placeholder {
+                    id: Id::new(),
+                    last_geometry: geometry,
+                    type_: PlaceholderType::GrabbedWindow,
+                }),
+                InsertBehavior::UnderNode(&root),
+            )
+            .unwrap()
+        };
+        let first = insert_placeholder(&mut tree);
+        let second = insert_placeholder(&mut tree);
+        let blocker = layout.update_positions_for(&mut tree, layout.gaps());
+        layout.queue.trees.clear();
+        layout.queue.push_tree(tree, Duration::ZERO, blocker);
+
+        assert_eq!(
+            layout
+                .scrolling
+                .next_focus(layout.tree(), &first, FocusDirection::Left),
+            FocusNavigation::Edge
+        );
+        assert_eq!(
+            layout
+                .scrolling
+                .next_focus(layout.tree(), &first, FocusDirection::Right),
+            FocusNavigation::Unavailable
+        );
+
+        assert!(layout.scrolling.begin_drag(&second));
+        layout
+            .scrolling
+            .finish_drag(Some(&second), ColumnDropTarget::Above(first.clone()));
+        assert_eq!(
+            layout
+                .scrolling
+                .next_focus(layout.tree(), &second, FocusDirection::Up),
+            FocusNavigation::Edge
+        );
+        assert_eq!(
+            layout
+                .scrolling
+                .next_focus(layout.tree(), &second, FocusDirection::Down),
+            FocusNavigation::Unavailable
+        );
+    }
+
+    #[test]
+    fn scrolling_keyboard_actions_merge_extract_and_resize_columns() {
+        let geometry = Rectangle::new((0, 0).into(), (1_200, 800).into());
+        let mut layout = empty_layout(TilingEngine::Scrolling);
+        let mut tree = Tree::new();
+        let root = tree
+            .insert(
+                Node::new(Data::Group {
+                    orientation: Orientation::Vertical,
+                    sizes: vec![400, 400, 400],
+                    last_geometry: geometry,
+                    alive: Arc::new(()),
+                    pill_indicator: None,
+                }),
+                InsertBehavior::AsRoot,
+            )
+            .unwrap();
+        let insert_placeholder = |tree: &mut Tree<Data>| {
+            tree.insert(
+                Node::new(Data::Placeholder {
+                    id: Id::new(),
+                    last_geometry: geometry,
+                    type_: PlaceholderType::GrabbedWindow,
+                }),
+                InsertBehavior::UnderNode(&root),
+            )
+            .unwrap()
+        };
+        let first = insert_placeholder(&mut tree);
+        let second = insert_placeholder(&mut tree);
+        let third = insert_placeholder(&mut tree);
+        let blocker = layout.update_positions_for(&mut tree, layout.gaps());
+        layout.queue.trees.clear();
+        layout.queue.push_tree(tree, Duration::ZERO, blocker);
+
+        assert_eq!(
+            layout
+                .scrolling
+                .move_tile_vertical(&second, Direction::Down),
+            TileMove::Moved
+        );
+        assert_eq!(
+            layout.scrolling.column_tiles(),
+            vec![vec![first.clone(), second.clone()], vec![third.clone()]]
+        );
+        let mut animated = layout.tree().copy_clone();
+        let blocker = layout.update_positions_for(&mut animated, layout.gaps());
+        layout.push_scrolling_animation(animated, blocker);
+        assert_eq!(layout.queue.trees.back().unwrap().1, ANIMATION_DURATION);
+        assert_eq!(
+            layout
+                .scrolling
+                .move_tile_vertical(&second, Direction::Down),
+            TileMove::Edge
+        );
+
+        assert!(layout.scrolling.move_column(&first, Direction::Left));
+        assert_eq!(
+            layout.scrolling.column_tiles(),
+            vec![vec![first], vec![second.clone()], vec![third]]
+        );
+        let mut animated = layout.tree().copy_clone();
+        let blocker = layout.update_positions_for(&mut animated, layout.gaps());
+        layout.push_scrolling_animation(animated, blocker);
+        assert_eq!(layout.queue.trees.len(), 2);
+        assert_eq!(layout.queue.trees.back().unwrap().1, ANIMATION_DURATION);
+
+        assert!(layout.cycle_scrolling_column_width_for(&second, ResizeDirection::Outwards));
+        assert_eq!(layout.scrolling.column_width_fractions(), [0.66, 1.0, 0.66]);
+        assert_eq!(layout.queue.trees.len(), 2);
+        assert_eq!(layout.queue.trees.back().unwrap().1, ANIMATION_DURATION);
+        assert!(layout.cycle_scrolling_column_width_for(&second, ResizeDirection::Inwards));
+        assert_eq!(
+            layout.scrolling.column_width_fractions(),
+            [0.66, 0.66, 0.66]
+        );
+        assert_eq!(layout.queue.trees.len(), 2);
+        assert_eq!(layout.queue.trees.back().unwrap().1, ANIMATION_DURATION);
+
+        let queued = layout.queue.trees.len();
+        let unavailable = layout.tree().root_node_id().unwrap().clone();
+        assert!(!layout.cycle_scrolling_column_width_for(&unavailable, ResizeDirection::Outwards));
+        assert_eq!(layout.queue.trees.len(), queued);
+
+        assert_eq!(
+            layout.resize_scrolling_column(&second, 1, ColumnResizeAnchor::Left),
+            Some(true)
+        );
+        assert_eq!(layout.scrolling.column_width_fractions(), [0.66, 1.0, 0.66]);
+        assert_eq!(layout.queue.trees.len(), 2);
+        assert_eq!(layout.queue.trees.back().unwrap().1, Duration::ZERO);
+
+        let mut classic = empty_layout(TilingEngine::Classic);
+        assert!(!classic.cycle_scrolling_column_width_for(&second, ResizeDirection::Outwards));
+        assert_eq!(classic.queue.trees.len(), 1);
+        assert_eq!(classic.queue.trees.back().unwrap().1, Duration::ZERO);
+    }
+
+    #[test]
+    fn scrolling_mouse_resize_keeps_the_opposite_column_edge_fixed() {
+        let geometry = Rectangle::new((0, 0).into(), (1_200, 800).into());
+        let mut layout = sized_scrolling_layout();
+        let mut tree = Tree::new();
+        let root = tree
+            .insert(
+                Node::new(Data::Group {
+                    orientation: Orientation::Vertical,
+                    sizes: vec![400, 400, 400],
+                    last_geometry: geometry,
+                    alive: Arc::new(()),
+                    pill_indicator: None,
+                }),
+                InsertBehavior::AsRoot,
+            )
+            .unwrap();
+        let insert_placeholder = |tree: &mut Tree<Data>| {
+            tree.insert(
+                Node::new(Data::Placeholder {
+                    id: Id::new(),
+                    last_geometry: geometry,
+                    type_: PlaceholderType::GrabbedWindow,
+                }),
+                InsertBehavior::UnderNode(&root),
+            )
+            .unwrap()
+        };
+        let first = insert_placeholder(&mut tree);
+        let second = insert_placeholder(&mut tree);
+        let third = insert_placeholder(&mut tree);
+        let blocker = layout.update_positions_for(&mut tree, layout.gaps());
+        layout.queue.trees.clear();
+        layout.queue.push_tree(tree, Duration::ZERO, blocker);
+
+        assert_eq!(
+            layout
+                .scrolling
+                .move_tile_vertical(&second, Direction::Down),
+            TileMove::Moved
+        );
+        let mut stacked = layout.tree().copy_clone();
+        let blocker = layout.update_positions_for(&mut stacked, layout.gaps());
+        layout.queue.trees.clear();
+        layout.queue.push_tree(stacked, Duration::ZERO, blocker);
+        assert_eq!(
+            layout.scrolling.column_tiles(),
+            [vec![first.clone(), second.clone()], vec![third.clone()]]
+        );
+
+        let initial = *layout.tree().get(&second).unwrap().data().geometry();
+        let initial_third = *layout.tree().get(&third).unwrap().data().geometry();
+        let fixed_right = initial.loc.x.saturating_add(initial.size.w);
+        assert_eq!(
+            layout.resize_scrolling_column(&second, 100, ColumnResizeAnchor::Right),
+            Some(true)
+        );
+        let right_anchored = *layout.tree().get(&second).unwrap().data().geometry();
+        let stacked_peer = *layout.tree().get(&first).unwrap().data().geometry();
+        let unrelated = *layout.tree().get(&third).unwrap().data().geometry();
+        assert_eq!(
+            right_anchored.loc.x.saturating_add(right_anchored.size.w),
+            fixed_right
+        );
+        assert_eq!(right_anchored.loc.x, initial.loc.x - 100);
+        assert_eq!(stacked_peer.loc.x, right_anchored.loc.x);
+        assert_eq!(stacked_peer.size.w, right_anchored.size.w);
+        assert_eq!(unrelated.loc.x, initial_third.loc.x);
+        assert_eq!(layout.queue.trees.back().unwrap().1, Duration::ZERO);
+        assert!(layout.queue.trees.back().unwrap().2.is_none());
+        assert!(layout.scrolling_live_resize.as_ref().is_some_and(|resize| {
+            !resize.finishing
+                && matches!(
+                    &resize.target,
+                    ScrollingResizeTarget::Column { tile, .. } if tile == &second
+                )
+        }));
+
+        let fixed_left = right_anchored.loc.x;
+        assert_eq!(
+            layout.resize_scrolling_column(&second, -50, ColumnResizeAnchor::Left),
+            Some(true)
+        );
+        let left_anchored = *layout.tree().get(&second).unwrap().data().geometry();
+        assert_eq!(left_anchored.loc.x, fixed_left);
+        assert_eq!(left_anchored.size.w, right_anchored.size.w - 50);
+
+        for _ in 0..64 {
+            assert_eq!(
+                layout.resize_scrolling_column(&second, 1, ColumnResizeAnchor::Left),
+                Some(true)
+            );
+            assert_eq!(
+                layout.resize_scrolling_column(&second, -1, ColumnResizeAnchor::Left),
+                Some(true)
+            );
+            assert!(layout.queue.trees.len() <= 2);
+            assert_eq!(layout.queue.trees.back().unwrap().1, Duration::ZERO);
+            assert!(layout.queue.trees.back().unwrap().2.is_none());
+        }
+        let after_reversals = *layout.tree().get(&second).unwrap().data().geometry();
+        assert_eq!(after_reversals, left_anchored);
+
+        layout.finish_scrolling_resize();
+        assert_eq!(
+            *layout.tree().get(&second).unwrap().data().geometry(),
+            left_anchored
+        );
+        assert_eq!(layout.queue.trees.back().unwrap().1, Duration::ZERO);
+        assert!(layout.queue.trees.back().unwrap().2.is_none());
+        assert!(
+            layout
+                .scrolling_live_resize
+                .as_ref()
+                .is_some_and(|resize| resize.finishing)
+        );
+        layout.update_animation_state();
+        assert!(layout.scrolling_live_resize.is_none());
+    }
+
+    #[test]
+    fn scrolling_vertical_resize_is_direct_bounded_and_changes_only_the_pair() {
+        let geometry = Rectangle::new((0, 0).into(), (1_200, 1_200).into());
+        let mut layout = sized_scrolling_layout();
+        layout.output.change_current_state(
+            Some(Mode {
+                size: (1_200, 1_200).into(),
+                refresh: 60_000,
+            }),
+            None,
+            None,
+            Some((0, 0).into()),
+        );
+        let mut tree = Tree::new();
+        let root = tree
+            .insert(
+                Node::new(Data::Group {
+                    orientation: Orientation::Vertical,
+                    sizes: vec![400, 400, 400],
+                    last_geometry: geometry,
+                    alive: Arc::new(()),
+                    pill_indicator: None,
+                }),
+                InsertBehavior::AsRoot,
+            )
+            .unwrap();
+        let insert_placeholder = |tree: &mut Tree<Data>| {
+            tree.insert(
+                Node::new(Data::Placeholder {
+                    id: Id::new(),
+                    last_geometry: geometry,
+                    type_: PlaceholderType::GrabbedWindow,
+                }),
+                InsertBehavior::UnderNode(&root),
+            )
+            .unwrap()
+        };
+        let first = insert_placeholder(&mut tree);
+        let second = insert_placeholder(&mut tree);
+        let third = insert_placeholder(&mut tree);
+        let blocker = layout.update_positions_for(&mut tree, layout.gaps());
+        layout.queue.trees.clear();
+        layout.queue.push_tree(tree, Duration::ZERO, blocker);
+
+        assert_eq!(
+            layout
+                .scrolling
+                .move_tile_vertical(&second, Direction::Down),
+            TileMove::Moved
+        );
+        assert_eq!(
+            layout.scrolling.move_tile_vertical(&third, Direction::Down),
+            TileMove::Moved
+        );
+        let mut stacked = layout.tree().copy_clone();
+        let blocker = layout.update_positions_for(&mut stacked, layout.gaps());
+        layout.queue.trees.clear();
+        layout.queue.push_tree(stacked, Duration::ZERO, blocker);
+        assert_eq!(
+            layout.scrolling.column_tiles(),
+            [vec![first.clone(), second.clone(), third.clone()]]
+        );
+
+        let initial_upper = *layout.tree().get(&first).unwrap().data().geometry();
+        let initial_lower = *layout.tree().get(&second).unwrap().data().geometry();
+        let initial_third = *layout.tree().get(&third).unwrap().data().geometry();
+        let gap = initial_lower.loc.y - initial_upper.loc.y.saturating_add(initial_upper.size.h);
+        let fixed_pair_top = initial_upper.loc.y;
+        let fixed_pair_bottom = initial_lower.loc.y.saturating_add(initial_lower.size.h);
+
+        assert_eq!(
+            layout.resize_scrolling_rows(&first, &second, 50),
+            Some(true)
+        );
+        let resized_upper = *layout.tree().get(&first).unwrap().data().geometry();
+        let resized_lower = *layout.tree().get(&second).unwrap().data().geometry();
+        assert_eq!(resized_upper.loc.y, fixed_pair_top);
+        assert_eq!(
+            resized_lower.loc.y.saturating_add(resized_lower.size.h),
+            fixed_pair_bottom
+        );
+        assert_eq!(
+            resized_lower.loc.y - resized_upper.loc.y.saturating_add(resized_upper.size.h),
+            gap
+        );
+        assert_eq!(
+            *layout.tree().get(&third).unwrap().data().geometry(),
+            initial_third
+        );
+        assert_eq!(layout.queue.trees.back().unwrap().1, Duration::ZERO);
+        assert!(layout.queue.trees.back().unwrap().2.is_none());
+        assert!(layout.scrolling_live_resize.as_ref().is_some_and(|resize| {
+            !resize.finishing
+                && resize.tiles == [first.clone(), second.clone()]
+                && matches!(
+                    &resize.target,
+                    ScrollingResizeTarget::Rows { upper, lower }
+                        if upper == &first && lower == &second
+                )
+        }));
+
+        for _ in 0..64 {
+            assert_eq!(layout.resize_scrolling_rows(&first, &second, 1), Some(true));
+            assert_eq!(
+                layout.resize_scrolling_rows(&first, &second, -1),
+                Some(true)
+            );
+            assert!(layout.queue.trees.len() <= 2);
+            assert_eq!(layout.queue.trees.back().unwrap().1, Duration::ZERO);
+            assert!(layout.queue.trees.back().unwrap().2.is_none());
+        }
+        assert_eq!(
+            *layout.tree().get(&first).unwrap().data().geometry(),
+            resized_upper
+        );
+        assert_eq!(
+            *layout.tree().get(&second).unwrap().data().geometry(),
+            resized_lower
+        );
+
+        layout.finish_scrolling_resize();
+        assert!(
+            layout
+                .scrolling_live_resize
+                .as_ref()
+                .is_some_and(|resize| resize.finishing)
+        );
+        assert!(layout.queue.trees.back().unwrap().2.is_none());
+        layout.update_animation_state();
+        assert!(layout.scrolling_live_resize.is_none());
+        assert_eq!(
+            *layout.tree().get(&first).unwrap().data().geometry(),
+            resized_upper
+        );
+        assert_eq!(
+            *layout.tree().get(&second).unwrap().data().geometry(),
+            resized_lower
+        );
+
+        assert_eq!(layout.resize_scrolling_rows(&first, &second, 5), Some(true));
+        assert!(layout.scrolling_live_resize.is_some());
+        assert!(layout.scrolling.begin_drag(&first));
+        layout
+            .scrolling
+            .finish_drag(Some(&first), ColumnDropTarget::Discard);
+        layout.update_scrolling_live_resize_state();
+        assert!(layout.scrolling_live_resize.is_none());
+    }
+
+    #[test]
+    fn single_column_recenters_when_mouse_resize_finishes() {
+        let geometry = Rectangle::new((0, 0).into(), (1_200, 800).into());
+        let mut layout = sized_scrolling_layout();
+        let mut tree = Tree::new();
+        let tile = tree
+            .insert(
+                Node::new(Data::Placeholder {
+                    id: Id::new(),
+                    last_geometry: geometry,
+                    type_: PlaceholderType::GrabbedWindow,
+                }),
+                InsertBehavior::AsRoot,
+            )
+            .unwrap();
+        let blocker = layout.update_positions_for(&mut tree, layout.gaps());
+        layout.queue.trees.clear();
+        layout.queue.push_tree(tree, Duration::ZERO, blocker);
+
+        let initial = *layout.tree().get(&tile).unwrap().data().geometry();
+        let center = initial.loc.x.saturating_mul(2) + initial.size.w;
+        let right = initial.loc.x.saturating_add(initial.size.w);
+        assert_eq!(
+            layout.resize_scrolling_column(&tile, 100, ColumnResizeAnchor::Right),
+            Some(true)
+        );
+        let anchored = *layout.tree().get(&tile).unwrap().data().geometry();
+        assert_eq!(anchored.loc.x.saturating_add(anchored.size.w), right);
+
+        layout.finish_scrolling_resize();
+        let centered = *layout.tree().get(&tile).unwrap().data().geometry();
+        assert_eq!(centered.size.w, anchored.size.w);
+        assert_eq!(centered.loc.x.saturating_mul(2) + centered.size.w, center);
+    }
+
+    #[test]
+    fn switching_engines_clears_an_active_scrolling_resize() {
+        let geometry = Rectangle::new((0, 0).into(), (1_200, 800).into());
+        let mut layout = sized_scrolling_layout();
+        let mut tree = Tree::new();
+        let tile = tree
+            .insert(
+                Node::new(Data::Placeholder {
+                    id: Id::new(),
+                    last_geometry: geometry,
+                    type_: PlaceholderType::GrabbedWindow,
+                }),
+                InsertBehavior::AsRoot,
+            )
+            .unwrap();
+        let blocker = layout.update_positions_for(&mut tree, layout.gaps());
+        layout.queue.trees.clear();
+        layout.queue.push_tree(tree, Duration::ZERO, blocker);
+
+        assert_eq!(
+            layout.resize_scrolling_column(&tile, 50, ColumnResizeAnchor::Left),
+            Some(true)
+        );
+        assert!(layout.scrolling_live_resize.is_some());
+
+        layout.set_mode(TilingEngine::Classic);
+        assert!(layout.scrolling_live_resize.is_none());
+        assert_eq!(layout.mode(), TilingEngine::Classic);
+    }
+
+    #[test]
+    fn scrolling_keyboard_width_animation_retargets_every_preset() {
+        let geometry = Rectangle::new((0, 0).into(), (1_200, 800).into());
+        let mut layout = sized_scrolling_layout();
+        let mut tree = Tree::new();
+        let root = tree
+            .insert(
+                Node::new(Data::Group {
+                    orientation: Orientation::Vertical,
+                    sizes: vec![600, 600],
+                    last_geometry: geometry,
+                    alive: Arc::new(()),
+                    pill_indicator: None,
+                }),
+                InsertBehavior::AsRoot,
+            )
+            .unwrap();
+        let insert_placeholder = |tree: &mut Tree<Data>| {
+            tree.insert(
+                Node::new(Data::Placeholder {
+                    id: Id::new(),
+                    last_geometry: geometry,
+                    type_: PlaceholderType::GrabbedWindow,
+                }),
+                InsertBehavior::UnderNode(&root),
+            )
+            .unwrap()
+        };
+        let first = insert_placeholder(&mut tree);
+        let second = insert_placeholder(&mut tree);
+        let third = insert_placeholder(&mut tree);
+        let blocker = layout.update_positions_for(&mut tree, layout.gaps());
+        layout.queue.trees.clear();
+        layout.queue.push_tree(tree, Duration::ZERO, blocker);
+
+        assert_eq!(
+            layout
+                .scrolling
+                .move_tile_vertical(&second, Direction::Down),
+            TileMove::Moved
+        );
+        let mut stacked = layout.tree().copy_clone();
+        let blocker = layout.update_positions_for(&mut stacked, layout.gaps());
+        layout.queue.trees.clear();
+        layout.queue.push_tree(stacked, Duration::ZERO, blocker);
+        assert_eq!(
+            layout.scrolling.column_tiles(),
+            [vec![first.clone(), second.clone()], vec![third]]
+        );
+
+        for expected in [1.0, 0.33, 0.5, 0.66] {
+            assert!(layout.cycle_scrolling_column_width_for(&second, ResizeDirection::Outwards));
+            assert_eq!(layout.scrolling.column_width_fractions()[0], expected);
+            assert_eq!(layout.queue.trees.len(), 2);
+            assert_eq!(layout.queue.trees.back().unwrap().1, ANIMATION_DURATION);
+
+            let target = &layout.queue.trees.back().unwrap().0;
+            let expected_width = layout.scrolling.column_widths()[0];
+            assert_eq!(
+                target.get(&first).unwrap().data().geometry().size.w,
+                expected_width
+            );
+            assert_eq!(
+                target.get(&second).unwrap().data().geometry().size.w,
+                expected_width
+            );
+        }
+
+        for expected in [0.5, 0.33, 1.0, 0.66] {
+            assert!(layout.cycle_scrolling_column_width_for(&second, ResizeDirection::Inwards));
+            assert_eq!(layout.scrolling.column_width_fractions()[0], expected);
+            assert_eq!(layout.queue.trees.len(), 2);
+            assert_eq!(layout.queue.trees.back().unwrap().1, ANIMATION_DURATION);
+        }
+
+        assert!(layout.cycle_scrolling_column_width_for(&second, ResizeDirection::Outwards));
+        layout.queue.animation_start = Some(Instant::now() - ANIMATION_DURATION / 2);
+        assert!(layout.cycle_scrolling_column_width_for(&second, ResizeDirection::Inwards));
+        assert_eq!(layout.scrolling.column_width_fractions()[0], 0.66);
+        assert_eq!(layout.queue.trees.len(), 2);
+        let rendered_width = layout
+            .queue
+            .trees
+            .front()
+            .unwrap()
+            .0
+            .get(&second)
+            .unwrap()
+            .data()
+            .geometry()
+            .size
+            .w;
+        let target_width = layout.scrolling.column_widths()[0];
+        assert!(rendered_width > target_width);
+        assert_eq!(
+            layout
+                .queue
+                .trees
+                .back()
+                .unwrap()
+                .0
+                .get(&second)
+                .unwrap()
+                .data()
+                .geometry()
+                .size
+                .w,
+            target_width
+        );
+
+        layout.queue.animation_start = Some(Instant::now());
+        assert!(layout.pan_scrolling_viewport(100.0));
+        assert_eq!(layout.queue.trees.len(), 2);
+        assert_eq!(layout.queue.trees.back().unwrap().1, Duration::ZERO);
+
+        assert_eq!(
+            layout.resize_scrolling_column(&second, 50, ColumnResizeAnchor::Left),
+            Some(true)
+        );
+        let continuous = layout.scrolling.column_width_fractions()[0];
+        assert!(continuous > 0.66 && continuous < 1.0);
+        assert_eq!(layout.queue.trees.back().unwrap().1, Duration::ZERO);
+        assert!(layout.cycle_scrolling_column_width_for(&second, ResizeDirection::Outwards));
+        assert_eq!(layout.scrolling.column_width_fractions()[0], 1.0);
+        assert_eq!(layout.queue.trees.len(), 2);
+        assert_eq!(layout.queue.trees.back().unwrap().1, ANIMATION_DURATION);
+
+        layout.queue.animation_start = Some(Instant::now());
+        assert_eq!(
+            layout.resize_scrolling_column(&second, -50, ColumnResizeAnchor::Left),
+            Some(true)
+        );
+        let continuous = layout.scrolling.column_width_fractions()[0];
+        assert!(continuous > 0.66 && continuous < 1.0);
+        assert_eq!(layout.queue.trees.back().unwrap().1, Duration::ZERO);
+        assert!(layout.cycle_scrolling_column_width_for(&second, ResizeDirection::Inwards));
+        assert_eq!(layout.scrolling.column_width_fractions()[0], 0.66);
+        assert_eq!(layout.queue.trees.len(), 2);
+        assert_eq!(layout.queue.trees.back().unwrap().1, ANIMATION_DURATION);
+    }
+
+    #[test]
+    fn mode_transition_retires_pending_blockers_on_new_geometry() {
+        let mut layout = empty_layout(TilingEngine::Classic);
+        layout.queue.push_tree(
+            Tree::new(),
+            ANIMATION_DURATION,
+            Some(TilingBlocker::new(std::iter::empty())),
+        );
+
+        layout.set_mode(TilingEngine::Scrolling);
+
+        assert_eq!(layout.queue.trees.len(), 2);
+        assert!(layout.queue.trees.front().unwrap().2.is_none());
+        assert!(layout.queue.trees.back().unwrap().2.is_some());
+        assert!(
+            layout
+                .queue
+                .trees
+                .iter()
+                .all(|(tree, _, _)| tree.root_node_id().is_none())
+        );
+
+        layout.update_animation_state();
+        assert!(layout.queue.animation_start.is_some());
+        layout.update_animation_state();
+        assert_eq!(layout.queue.trees.len(), 1);
+        assert!(layout.queue.trees.front().unwrap().2.is_none());
+    }
+
+    #[test]
+    fn classic_geometry_is_restored_after_an_engine_round_trip() {
+        let output = test_output();
+        output.change_current_state(
+            Some(Mode {
+                size: (1_200, 800).into(),
+                refresh: 60_000,
+            }),
+            None,
+            None,
+            Some((0, 0).into()),
+        );
+        let mut layout = TilingLayout::new(
+            cosmic::Theme::default(),
+            AppearanceConfig::default(),
+            &output,
+            TilingEngine::Classic,
+        );
+
+        let sentinel = Rectangle::from_size((7, 7).into());
+        let mut tree = Tree::new();
+        let root = tree
+            .insert(
+                Node::new(Data::Group {
+                    orientation: Orientation::Vertical,
+                    sizes: vec![400, 400, 400],
+                    last_geometry: Rectangle::new((0, 0).into(), (1_200, 800).into()),
+                    alive: Arc::new(()),
+                    pill_indicator: None,
+                }),
+                InsertBehavior::AsRoot,
+            )
+            .unwrap();
+        let insert_leaf = |tree: &mut Tree<Data>| {
+            tree.insert(
+                Node::new(Data::Placeholder {
+                    id: Id::new(),
+                    last_geometry: sentinel,
+                    type_: PlaceholderType::GrabbedWindow,
+                }),
+                InsertBehavior::UnderNode(&root),
+            )
+            .unwrap()
+        };
+        let leaves = [
+            insert_leaf(&mut tree),
+            insert_leaf(&mut tree),
+            insert_leaf(&mut tree),
+        ];
+
+        let blocker = layout.update_positions_for(&mut tree, layout.gaps());
+        layout.queue.trees.clear();
+        layout.queue.push_tree(tree, Duration::ZERO, blocker);
+
+        let leaf_geometries = |layout: &TilingLayout| {
+            leaves
+                .iter()
+                .map(|leaf| *layout.tree().get(leaf).unwrap().data().geometry())
+                .collect::<Vec<_>>()
+        };
+        let preorder = |layout: &TilingLayout| {
+            layout
+                .tree()
+                .traverse_pre_order_ids(&root)
+                .unwrap()
+                .collect::<Vec<_>>()
+        };
+
+        let before_geometries = leaf_geometries(&layout);
+        let before_preorder = preorder(&layout);
+        // Classic must actually have sized these leaves, otherwise the
+        // round-trip comparison below could pass without proving anything.
+        assert!(
+            before_geometries
+                .iter()
+                .all(|geometry| *geometry != sentinel)
+        );
+
+        for (index, geometry) in before_geometries.iter().enumerate() {
+            assert!(!before_geometries[..index].contains(geometry));
+        }
+
+        layout.set_mode(TilingEngine::Scrolling);
+        assert_ne!(leaf_geometries(&layout), before_geometries);
+        layout.set_mode(TilingEngine::Classic);
+
+        assert_eq!(layout.mode(), TilingEngine::Classic);
+        assert_eq!(leaf_geometries(&layout), before_geometries);
+        assert_eq!(preorder(&layout), before_preorder);
     }
 }

@@ -1,7 +1,12 @@
 use cosmic_settings_config::shortcuts::action::Direction;
-use smithay::utils::{Logical, Point};
+use smithay::{
+    output::Output,
+    utils::{Logical, Point},
+};
 use std::{collections::VecDeque, time::Duration};
 use tracing::trace;
+
+use crate::wayland::protocols::workspace::WorkspaceHandle;
 
 const HISTORY_LIMIT: Duration = Duration::from_millis(150);
 const DECELERATION_TOUCHPAD: f64 = 0.997;
@@ -16,6 +21,13 @@ pub struct SwipeEvent {
 pub enum SwipeAction {
     NextWorkspace,
     PrevWorkspace,
+    ScrollingPan,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScrollingPanTarget {
+    pub output: Output,
+    pub workspace: WorkspaceHandle,
 }
 
 #[derive(Debug, Clone)]
@@ -23,6 +35,9 @@ pub struct GestureState {
     pub fingers: u32,
     pub direction: Option<Direction>,
     pub action: Option<SwipeAction>,
+    /// Captured at begin so a gesture cannot migrate to another workspace or
+    /// become eligible after beginning outside Scrolling mode.
+    pub scrolling_pan_target: Option<ScrollingPanTarget>,
     pub delta: f64,
     // Delta tracking inspired by Niri (GPL-3.0) https://github.com/YaLTeR/niri/tree/v0.1.3
     pub history: VecDeque<SwipeEvent>,
@@ -34,6 +49,7 @@ impl GestureState {
             fingers,
             direction: None,
             action: None,
+            scrolling_pan_target: None,
             delta: 0.0,
             history: VecDeque::new(),
         }

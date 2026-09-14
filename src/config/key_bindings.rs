@@ -1,6 +1,6 @@
 use cosmic_settings_config::shortcuts::State as KeyState;
 use cosmic_settings_config::shortcuts::{self, Modifiers};
-use smithay::input::keyboard::ModifiersState;
+use smithay::input::keyboard::{Keysym, ModifiersState};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Action {
@@ -14,11 +14,26 @@ pub enum Action {
 // Behaviors which are internally defined and emitted.
 pub enum PrivateAction {
     Escape,
+    CenterScrollingColumn,
     Resizing(
         shortcuts::action::ResizeDirection,
         shortcuts::action::ResizeEdge,
         shortcuts::State,
     ),
+}
+
+/// Default compositor-private binding which is not yet represented by the
+/// public cosmic-settings shortcut action enum.
+pub fn center_scrolling_binding() -> shortcuts::Binding {
+    shortcuts::Binding {
+        modifiers: Modifiers {
+            logo: true,
+            ..Modifiers::default()
+        },
+        keycode: None,
+        key: Some(Keysym::c),
+        description: None,
+    }
 }
 
 /// Convert `cosmic_settings_config::shortcuts::State` to `smithay::backend::input::KeyState`.
@@ -52,5 +67,20 @@ pub fn cosmic_modifiers_from_smithay(value: ModifiersState) -> Modifiers {
         alt: value.alt,
         shift: value.shift,
         logo: value.logo,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scrolling_center_uses_super_c_without_extra_modifiers() {
+        let binding = center_scrolling_binding();
+        assert_eq!(binding.key, Some(Keysym::c));
+        assert!(binding.modifiers.logo);
+        assert!(!binding.modifiers.ctrl);
+        assert!(!binding.modifiers.alt);
+        assert!(!binding.modifiers.shift);
     }
 }
