@@ -96,6 +96,10 @@ impl State {
                 }
             }
 
+            Action::Private(PrivateAction::CenterScrollingColumn) => {
+                self.common.shell.write().center_scrolling_column(seat);
+            }
+
             Action::Private(PrivateAction::Resizing(direction, edge, state)) => {
                 if state == shortcuts::State::Pressed {
                     self.common
@@ -140,6 +144,7 @@ impl State {
                     &mut self.common.workspace_state.update(),
                 );
             }
+            SwipeAction::ScrollingPan => {}
         }
     }
 
@@ -156,6 +161,13 @@ impl State {
         propagate: bool,
     ) {
         use shortcuts::Action;
+
+        let effective_workspace_layout = self
+            .common
+            .config
+            .cosmic_conf
+            .tiling_engine
+            .effective_workspace_layout(self.common.config.cosmic_conf.workspaces.workspace_layout);
 
         match action {
             Action::Terminate => {
@@ -211,11 +223,9 @@ impl State {
             Action::NextWorkspace => {
                 if let Some(direction) = pattern.inferred_direction()
                     && (((direction == Direction::Left || direction == Direction::Right)
-                        && self.common.config.cosmic_conf.workspaces.workspace_layout
-                            == WorkspaceLayout::Vertical)
+                        && effective_workspace_layout == WorkspaceLayout::Vertical)
                         || ((direction == Direction::Up || direction == Direction::Down)
-                            && self.common.config.cosmic_conf.workspaces.workspace_layout
-                                == WorkspaceLayout::Horizontal))
+                            && effective_workspace_layout == WorkspaceLayout::Horizontal))
                 {
                     return;
                 }
@@ -251,11 +261,9 @@ impl State {
             Action::PreviousWorkspace => {
                 if let Some(direction) = pattern.inferred_direction()
                     && (((direction == Direction::Left || direction == Direction::Right)
-                        && self.common.config.cosmic_conf.workspaces.workspace_layout
-                            == WorkspaceLayout::Vertical)
+                        && effective_workspace_layout == WorkspaceLayout::Vertical)
                         || ((direction == Direction::Up || direction == Direction::Down)
-                            && self.common.config.cosmic_conf.workspaces.workspace_layout
-                                == WorkspaceLayout::Horizontal))
+                            && effective_workspace_layout == WorkspaceLayout::Horizontal))
                 {
                     return;
                 }
@@ -347,11 +355,9 @@ impl State {
             x @ Action::MoveToNextWorkspace | x @ Action::SendToNextWorkspace => {
                 if let Some(direction) = pattern.inferred_direction()
                     && (((direction == Direction::Left || direction == Direction::Right)
-                        && self.common.config.cosmic_conf.workspaces.workspace_layout
-                            == WorkspaceLayout::Vertical)
+                        && effective_workspace_layout == WorkspaceLayout::Vertical)
                         || ((direction == Direction::Up || direction == Direction::Down)
-                            && self.common.config.cosmic_conf.workspaces.workspace_layout
-                                == WorkspaceLayout::Horizontal))
+                            && effective_workspace_layout == WorkspaceLayout::Horizontal))
                 {
                     return;
                 }
@@ -441,11 +447,9 @@ impl State {
             x @ Action::MoveToPreviousWorkspace | x @ Action::SendToPreviousWorkspace => {
                 if let Some(direction) = pattern.inferred_direction()
                     && (((direction == Direction::Left || direction == Direction::Right)
-                        && self.common.config.cosmic_conf.workspaces.workspace_layout
-                            == WorkspaceLayout::Vertical)
+                        && effective_workspace_layout == WorkspaceLayout::Vertical)
                         || ((direction == Direction::Up || direction == Direction::Down)
-                            && self.common.config.cosmic_conf.workspaces.workspace_layout
-                                == WorkspaceLayout::Horizontal))
+                            && effective_workspace_layout == WorkspaceLayout::Horizontal))
                 {
                     return;
                 }
@@ -774,10 +778,7 @@ impl State {
                                 }
                             }
 
-                            let action = match (
-                                direction,
-                                self.common.config.cosmic_conf.workspaces.workspace_layout,
-                            ) {
+                            let action = match (direction, effective_workspace_layout) {
                                 (Direction::Left, WorkspaceLayout::Horizontal)
                                 | (Direction::Up, WorkspaceLayout::Vertical) => {
                                     Action::PreviousWorkspace
@@ -833,10 +834,7 @@ impl State {
                             }
                         }
 
-                        let action = match (
-                            direction,
-                            self.common.config.cosmic_conf.workspaces.workspace_layout,
-                        ) {
+                        let action = match (direction, effective_workspace_layout) {
                             (Direction::Left, WorkspaceLayout::Horizontal)
                             | (Direction::Up, WorkspaceLayout::Vertical) => {
                                 Action::MoveToPreviousWorkspace
@@ -862,6 +860,7 @@ impl State {
                     MoveResult::ShiftFocus(shift) => {
                         Shell::set_focus(self, Some(&shift), seat, None, true);
                     }
+                    MoveResult::Handled => {}
                     _ => {
                         let current_output = seat.active_output();
                         let mut shell = self.common.shell.write();
@@ -951,11 +950,16 @@ impl State {
                 }
             }
 
-            Action::Resizing(direction) => self.common.shell.write().set_resize_mode(
-                Some((pattern, direction)),
-                &self.common.config,
-                self.common.event_loop_handle.clone(),
-            ),
+            Action::Resizing(direction) => {
+                let mut shell = self.common.shell.write();
+                if !shell.cycle_scrolling_column_width(direction, seat) {
+                    shell.set_resize_mode(
+                        Some((pattern, direction)),
+                        &self.common.config,
+                        self.common.event_loop_handle.clone(),
+                    );
+                }
+            }
             // NOTE: implementation currently assumes actions that apply to outputs should apply to the active output
             // rather than the output that has keyboard focus
             Action::ToggleOrientation => {

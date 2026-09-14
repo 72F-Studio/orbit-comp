@@ -5,11 +5,11 @@ use crate::{
     config::{
         Action, Config, PrivateAction,
         key_bindings::{
-            cosmic_keystate_from_smithay, cosmic_modifiers_eq_smithay,
+            center_scrolling_binding, cosmic_keystate_from_smithay, cosmic_modifiers_eq_smithay,
             cosmic_modifiers_from_smithay,
         },
     },
-    input::gestures::{GestureState, SwipeAction},
+    input::gestures::{GestureState, ScrollingPanTarget, SwipeAction},
     shell::{
         SeatExt, Trigger,
         focus::{
@@ -1133,8 +1133,22 @@ impl State {
                     .cloned();
                 if let Some(seat) = maybe_seat {
                     self.common.idle_notifier_state.notify_activity(&seat);
-                    if event.fingers() >= 3 && !workspace_overview_is_open(&seat.active_output()) {
-                        self.common.gesture_state = Some(GestureState::new(event.fingers()));
+                    let active_output = seat.active_output();
+                    if event.fingers() >= 3 && !workspace_overview_is_open(&active_output) {
+                        let mut gesture_state = GestureState::new(event.fingers());
+                        if event.fingers() == 3
+                            && let Some(workspace) = self
+                                .common
+                                .shell
+                                .read()
+                                .scrolling_pan_target(&active_output)
+                        {
+                            gesture_state.scrolling_pan_target = Some(ScrollingPanTarget {
+                                output: active_output,
+                                workspace,
+                            });
+                        }
+                        self.common.gesture_state = Some(gesture_state);
                     } else {
                         let serial = SERIAL_COUNTER.next_serial();
                         let pointer = seat.get_pointer().unwrap();
@@ -1174,12 +1188,23 @@ impl State {
                             {
                                 natural_scroll = natural;
                             }
+                            let workspace_layout = self
+                                .common
+                                .config
+                                .cosmic_conf
+                                .tiling_engine
+                                .effective_workspace_layout(
+                                    self.common.config.cosmic_conf.workspaces.workspace_layout,
+                                );
                             activate_action = match gesture_state.fingers {
-                                3 => None, // TODO: 3 finger gestures
+                                3 => matches!(
+                                    gesture_state.direction,
+                                    Some(Direction::Left | Direction::Right)
+                                )
+                                .then_some(SwipeAction::ScrollingPan)
+                                .filter(|_| gesture_state.scrolling_pan_target.is_some()),
                                 4 => {
-                                    if self.common.config.cosmic_conf.workspaces.workspace_layout
-                                        == WorkspaceLayout::Horizontal
-                                    {
+                                    if workspace_layout == WorkspaceLayout::Horizontal {
                                         match gesture_state.direction {
                                             Some(Direction::Left) => {
                                                 if natural_scroll {
@@ -1232,6 +1257,41 @@ impl State {
                                     matches!(x, SwipeAction::NextWorkspace),
                                 )
                             }
+                            Some(SwipeAction::ScrollingPan) => {
+                                if let Some(target) = gesture_state.scrolling_pan_target.as_ref() {
+                                    if seat.active_output() != target.output {
+                                        gesture_state.action = None;
+                                    } else {
+                                        let natural_scroll = self
+                                            .common
+                                            .config
+                                            .cosmic_conf
+                                            .input_touchpad
+                                            .scroll_config
+                                            .as_ref()
+                                            .and_then(|config| config.natural_scroll)
+                                            .unwrap_or(false);
+                                        let delta_x = if natural_scroll {
+                                            -event.delta().x
+                                        } else {
+                                            event.delta().x
+                                        };
+                                        match self.common.shell.write().pan_scrolling_viewport(
+                                            &target.output,
+                                            target.workspace,
+                                            delta_x,
+                                        ) {
+                                            Some(true) => {
+                                                self.backend.schedule_render(&target.output)
+                                            }
+                                            Some(false) => {}
+                                            None => gesture_state.action = None,
+                                        }
+                                    }
+                                } else {
+                                    gesture_state.action = None;
+                                }
+                            }
                             _ => {}
                         }
                     } else {
@@ -1264,21 +1324,25 @@ impl State {
                         match gesture_state.action {
                             Some(SwipeAction::NextWorkspace) | Some(SwipeAction::PrevWorkspace) => {
                                 let velocity = gesture_state.velocity();
-                                let norm_velocity =
-                                    if self.common.config.cosmic_conf.workspaces.workspace_layout
-                                        == WorkspaceLayout::Horizontal
-                                    {
-                                        velocity / seat.active_output().geometry().size.w as f64
-                                    } else {
-                                        velocity / seat.active_output().geometry().size.h as f64
-                                    };
+                                // Keep an in-flight gesture on the axis chosen
+                                // by its first update, even if the tiling engine
+                                // changes before the fingers are released.
+                                let horizontal = matches!(
+                                    gesture_state.direction,
+                                    Some(Direction::Left | Direction::Right)
+                                );
+                                let norm_velocity = if horizontal {
+                                    velocity / seat.active_output().geometry().size.w as f64
+                                } else {
+                                    velocity / seat.active_output().geometry().size.h as f64
+                                };
                                 let _ = self.common.shell.write().end_workspace_swipe(
                                     &seat.active_output(),
                                     norm_velocity,
                                     &mut self.common.workspace_state.update(),
                                 );
                             }
-                            _ => {}
+                            Some(SwipeAction::ScrollingPan) | None => {}
                         }
                         self.common.gesture_state = None;
                     } else {
@@ -2449,6 +2513,11 @@ impl State {
         let mut clear_queue = true;
         if !shortcuts_inhibited {
             let modifiers_queue = seat.modifiers_shortcut_queue();
+            let configured_key_binding = self.common.config.shortcuts.iter().any(|(binding, _)| {
+                binding.key.is_some()
+                    && key_matches(binding.key.unwrap())
+                    && cosmic_modifiers_eq_smithay(&binding.modifiers, modifiers)
+            });
 
             for (binding, action) in self.common.config.shortcuts.iter() {
                 if *action == shortcuts::Action::Disable {
@@ -2488,6 +2557,26 @@ impl State {
                     return FilterResult::Intercept(Some((
                         Action::Shortcut(action.clone()),
                         binding.clone(),
+                    )));
+                }
+            }
+
+            // Preserve any user-configured action (including Disable) for this
+            // key. Super+C is only the private default when no configured
+            // shortcut claims the same binding.
+            if !configured_key_binding
+                && key_state == KeyState::Pressed
+                && self.common.shell.read().scrolling_tiling_active(seat)
+            {
+                let binding = center_scrolling_binding();
+                if binding.key.is_some_and(key_matches)
+                    && cosmic_modifiers_eq_smithay(&binding.modifiers, modifiers)
+                {
+                    modifiers_queue.clear(backend_id);
+                    seat.supressed_keys().add(backend_id, &handle, None);
+                    return FilterResult::Intercept(Some((
+                        Action::Private(PrivateAction::CenterScrollingColumn),
+                        binding,
                     )));
                 }
             }

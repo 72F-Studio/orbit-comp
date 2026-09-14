@@ -146,7 +146,7 @@ fn render_input_order_internal<R: 'static>(
 
     let (previous, current_offset) = match previous.as_ref() {
         Some((previous, previous_idx, start)) => {
-            let layout = shell.workspaces.layout;
+            let layout = shell.workspaces.effective_layout();
 
             let Some(workspace) = shell.workspaces.space_for_handle(previous) else {
                 return ControlFlow::Break(Err(OutputNoMode));

@@ -253,6 +253,10 @@ impl Shell {
                 .unwrap()
         };
 
+        if let FocusTarget::Window(mapped) = &target {
+            workspace.tiling_layer.ensure_visible(mapped);
+        }
+
         let mut focus_stack = workspace.focus_stack.get_mut(seat);
         if Some(&target) != focus_stack.last() {
             trace!(?target, "Focusing window.");

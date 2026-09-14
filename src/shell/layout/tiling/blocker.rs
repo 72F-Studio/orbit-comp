@@ -59,4 +59,14 @@ impl TilingBlocker {
             .map(|client| (client.id(), client))
             .collect::<HashMap<ClientId, Client>>()
     }
+
+    /// Combine superseded configure waits. For a surface with multiple queued
+    /// configures, waiting for the newest serial also covers every older one.
+    pub(super) fn absorb(&mut self, other: TilingBlocker) {
+        self.start = self.start.max(other.start);
+        for (surface, serial) in other.necessary_acks {
+            self.necessary_acks.retain(|(known, _)| known != &surface);
+            self.necessary_acks.push((surface, serial));
+        }
+    }
 }

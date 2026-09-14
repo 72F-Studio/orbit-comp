@@ -14,3 +14,9 @@ vendor.tar
 .vscode
 *.log
 /result
+
+# Internal dev notes for this scrolling-engine prototype; not for publishing.
+/.codex-review/
+/PROJECT_HANDOFF.md
+/roadmap.md
+/testing.md

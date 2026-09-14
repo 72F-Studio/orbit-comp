@@ -838,11 +838,19 @@ impl Drop for MoveGrab {
                         ManagedLayer::Tiling
                             if shell.active_space(&output).unwrap().tiling_enabled =>
                         {
+                            let source_geometry = Rectangle::new(
+                                window_location.to_local(&output),
+                                (
+                                    grab_state.window.geometry().size.w,
+                                    grab_state.window.geometry().size.h,
+                                )
+                                    .into(),
+                            );
                             let (window, location) = shell
                                 .active_space_mut(&output)
                                 .unwrap()
                                 .tiling_layer
-                                .drop_window(grab_state.window);
+                                .drop_window(grab_state.window, source_geometry);
                             Some((window, location.to_global(&output)))
                         }
                         _ => {

@@ -12,6 +12,7 @@ use tracing::warn;
 use super::CosmicSurface;
 
 pub mod floating;
+pub mod scrolling;
 pub mod tiling;
 
 pub fn is_dialog(window: &CosmicSurface) -> bool {

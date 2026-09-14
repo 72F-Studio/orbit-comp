@@ -66,6 +66,28 @@ impl Default for AppearanceConfig {
     }
 }
 
+/// Selects the layout engine used when a workspace has tiling enabled.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+pub enum TilingEngine {
+    /// COSMIC's tree-based tiling layout.
+    #[default]
+    Classic,
+    /// A horizontally scrolling strip of tiled columns.
+    Scrolling,
+}
+
+impl TilingEngine {
+    pub fn effective_workspace_layout(
+        self,
+        configured: workspace::WorkspaceLayout,
+    ) -> workspace::WorkspaceLayout {
+        match self {
+            Self::Classic => configured,
+            Self::Scrolling => workspace::WorkspaceLayout::Vertical,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, CosmicConfigEntry)]
 #[version = 1]
 pub struct CosmicCompConfig {
@@ -79,6 +101,8 @@ pub struct CosmicCompConfig {
     pub keyboard_config: KeyboardConfig,
     /// Autotiling enabled
     pub autotile: bool,
+    /// Selects the tiling layout engine independently of whether tiling is enabled
+    pub tiling_engine: TilingEngine,
     /// Determines the behavior of the autotile variable
     /// If set to Global, autotile applies to all windows in all workspaces
     /// If set to PerWorkspace, autotile only applies to new windows, and new workspaces
@@ -130,6 +154,7 @@ impl Default for CosmicCompConfig {
             xkb_config: Default::default(),
             keyboard_config: Default::default(),
             autotile: Default::default(),
+            tiling_engine: Default::default(),
             autotile_behavior: Default::default(),
             active_hint: true,
             focus_follows_cursor: false,
@@ -253,4 +278,107 @@ pub enum XwaylandDescaling {
     Disabled,
     #[default]
     Fractional,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cosmic_config::ConfigSet;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use workspace::WorkspaceLayout;
+
+    #[test]
+    fn tiling_engine_defaults_to_classic() {
+        assert_eq!(TilingEngine::default(), TilingEngine::Classic);
+    }
+
+    #[test]
+    fn tiling_engine_has_stable_ron_values() {
+        assert_eq!(
+            ron::ser::to_string(&TilingEngine::Classic).unwrap(),
+            "Classic"
+        );
+        assert_eq!(
+            ron::ser::to_string(&TilingEngine::Scrolling).unwrap(),
+            "Scrolling"
+        );
+        assert_eq!(
+            ron::from_str::<TilingEngine>("Classic").unwrap(),
+            TilingEngine::Classic
+        );
+        assert_eq!(
+            ron::from_str::<TilingEngine>("Scrolling").unwrap(),
+            TilingEngine::Scrolling
+        );
+    }
+
+    #[test]
+    fn cosmic_comp_config_defaults_to_classic_tiling() {
+        assert_eq!(
+            CosmicCompConfig::default().tiling_engine,
+            TilingEngine::Classic
+        );
+    }
+
+    #[test]
+    fn legacy_config_without_tiling_engine_uses_classic() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let config_root = std::env::temp_dir().join(format!(
+            "cosmic-comp-config-test-{}-{unique}",
+            std::process::id()
+        ));
+        let config = cosmic_config::Config::with_custom_path(
+            "com.system76.CosmicComp",
+            CosmicCompConfig::VERSION,
+            config_root.clone(),
+        )
+        .unwrap();
+        config.set("autotile", true).unwrap();
+
+        let mut loaded = CosmicCompConfig::get_entry(&config).unwrap_or_else(|(_, config)| config);
+
+        assert!(loaded.autotile);
+        assert_eq!(loaded.tiling_engine, TilingEngine::Classic);
+        assert!(
+            loaded
+                .set_tiling_engine(&config, TilingEngine::Scrolling)
+                .unwrap()
+        );
+        let reloaded = CosmicCompConfig::get_entry(&config).unwrap_or_else(|(_, config)| config);
+        assert_eq!(reloaded.tiling_engine, TilingEngine::Scrolling);
+        std::fs::remove_dir_all(config_root).unwrap();
+    }
+
+    #[test]
+    fn effective_workspace_layout_tracks_engine_and_restores_configuration() {
+        assert_eq!(
+            TilingEngine::Classic.effective_workspace_layout(WorkspaceLayout::Vertical),
+            WorkspaceLayout::Vertical
+        );
+        assert_eq!(
+            TilingEngine::Classic.effective_workspace_layout(WorkspaceLayout::Horizontal),
+            WorkspaceLayout::Horizontal
+        );
+        assert_eq!(
+            TilingEngine::Scrolling.effective_workspace_layout(WorkspaceLayout::Vertical),
+            WorkspaceLayout::Vertical
+        );
+        assert_eq!(
+            TilingEngine::Scrolling.effective_workspace_layout(WorkspaceLayout::Horizontal),
+            WorkspaceLayout::Vertical
+        );
+
+        let configured = WorkspaceLayout::Horizontal;
+        assert_eq!(
+            TilingEngine::Scrolling.effective_workspace_layout(configured),
+            WorkspaceLayout::Vertical
+        );
+        assert_eq!(
+            TilingEngine::Classic.effective_workspace_layout(configured),
+            configured
+        );
+    }
 }
