@@ -1,3 +1,7 @@
+> **Orbit** is a fork of cosmic-comp that adds a scrolling tiling layout.
+> It is not a System76 project. See [NOTICE.md](NOTICE.md) for its origin and
+> licence, and [docs/test-session.md](docs/test-session.md) to try it.
+
 # cosmic-comp
 Compositor for the COSMIC desktop environment
 

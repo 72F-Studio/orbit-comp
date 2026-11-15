@@ -11,7 +11,7 @@ session. When the parent suite's `install.sh` has built the modified applet,
 this launcher also uses its owned `.cosmic-scrolling/prefix` for the Window
 Layout applet and icons. Without that optional installation, it uses system
 applets; use the CLI below to select Classic or Scrolling. For the complete
-compositor + applet installation, follow the [parent README](../README.md).
+compositor + applet installation, follow the parent README.
 
 No repository path is hardcoded. The installer creates
 `/usr/local/bin/cosmic-scrolling-test-session` as a symlink to this clone's
