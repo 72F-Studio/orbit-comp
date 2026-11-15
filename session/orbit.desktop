@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Orbit
+Comment=COSMIC with the Orbit scrolling tiling compositor
+Exec=/usr/local/bin/orbit-session
+TryExec=/usr/local/bin/orbit-session
+Type=Application
+DesktopNames=COSMIC
+X-OrbitOwner=orbit-session-v1

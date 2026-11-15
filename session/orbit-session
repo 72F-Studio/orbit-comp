@@ -1,0 +1,104 @@
+#!/bin/sh
+# Orbit login session launcher. Installed as /usr/local/bin/orbit-session and
+# started by the greeter through /usr/share/wayland-sessions/orbit.desktop.
+# X-OrbitOwner=orbit-session-v1
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# It runs the normal COSMIC session with Orbit's compositor and Window Layout
+# applet first in PATH. If Orbit's files are missing it starts plain COSMIC
+# instead, so a broken install never locks you out.
+
+set -u
+
+ORBIT_DATA=${XDG_DATA_HOME:-$HOME/.local/share}/orbit
+ORBIT_PREFIX=$ORBIT_DATA/prefix
+ORBIT_STATE=${XDG_STATE_HOME:-$HOME/.local/state}/orbit
+LOG=$ORBIT_STATE/session.log
+SESSION_LAUNCHER=${ORBIT_START_COSMIC:-/usr/bin/start-cosmic}
+COMP_CONFIG=${XDG_CONFIG_HOME:-$HOME/.config}/cosmic/com.system76.CosmicComp/v1
+
+mkdir -p "$ORBIT_STATE" 2>/dev/null
+log() { printf '%s %s\n' "$(date -Is)" "$*" >>"$LOG" 2>/dev/null; }
+
+# Tell the user once the desktop is up, then start plain COSMIC.
+fall_back() {
+    code=$1 headline=$2 description=$3 why=$4
+    log "$code $headline: $why"
+    if command -v notify-send >/dev/null 2>&1; then
+        (
+            sleep "${ORBIT_NOTIFY_DELAY:-20}"
+            notify-send -a Orbit -u critical "$headline" \
+                "$description
+
+Details: error $code. For a report you can send, run: ~/.local/share/orbit/prefix/bin/orbit-report $code" \
+                >/dev/null 2>&1
+        ) &
+    fi
+    exec "$SESSION_LAUNCHER"
+}
+
+if [ -n "${WAYLAND_DISPLAY-}" ] || [ -n "${DISPLAY-}" ]; then
+    printf '%s\n' "Orbit starts a whole desktop session, so it can't run inside one." \
+        "Log out, pick Orbit at the login screen, and log in." \
+        "  Details: error ORB-S03 (a graphical session is already running)" >&2
+    exit 1
+fi
+
+if [ ! -x "$SESSION_LAUNCHER" ]; then
+    log "ORB-S02 COSMIC session launcher missing: $SESSION_LAUNCHER"
+    printf '%s\n' "COSMIC isn't installed, so Orbit can't start." \
+        "  Details: error ORB-S02 ($SESSION_LAUNCHER is missing)" >&2
+    exit 1
+fi
+
+# Load the user's login environment first, the way start-cosmic does, so the
+# PATH changes below are made on top of it instead of being replaced by it.
+if [ "${1-}" != --in-login-shell ] && [ -n "${SHELL-}" ] && [ -x "$SHELL" ]; then
+    # Same form as start-cosmic, so it also works with fish and other
+    # non-POSIX login shells. The installed path has no spaces.
+    exec "$SHELL" -l -c "$0 --in-login-shell"
+fi
+
+if [ ! -x "$ORBIT_PREFIX/bin/cosmic-comp" ]; then
+    fall_back ORB-S01 "Orbit didn't start" \
+        "Orbit's compositor isn't installed for your account, so the normal COSMIC desktop was started instead. Run session/install.sh from your Orbit checkout, then log in again." \
+        "missing $ORBIT_PREFIX/bin/cosmic-comp"
+fi
+
+# First Orbit login: make tiled workspaces scroll. Later choices are kept, and
+# the normal COSMIC compositor ignores this key.
+if [ ! -e "$COMP_CONFIG/tiling_engine" ]; then
+    mkdir -p "$COMP_CONFIG" && printf '%s\n' Scrolling >"$COMP_CONFIG/tiling_engine"
+fi
+
+# start-cosmic copies this environment into the systemd user manager, which
+# outlives the session. Put the old values back on logout so a later normal
+# COSMIC login doesn't pick up Orbit's binaries.
+ORIGINAL_PATH=$PATH
+ORIGINAL_XDG_DATA_DIRS=${XDG_DATA_DIRS-}
+ORIGINAL_XDG_DATA_DIRS_SET=${XDG_DATA_DIRS+x}
+restore_user_manager_environment() {
+    command -v systemctl >/dev/null 2>&1 || return 0
+    systemctl --user set-environment "PATH=$ORIGINAL_PATH" >/dev/null 2>&1
+    if [ -n "$ORIGINAL_XDG_DATA_DIRS_SET" ]; then
+        systemctl --user set-environment "XDG_DATA_DIRS=$ORIGINAL_XDG_DATA_DIRS" >/dev/null 2>&1
+    else
+        systemctl --user unset-environment XDG_DATA_DIRS >/dev/null 2>&1
+    fi
+    systemctl --user unset-environment ORBIT_SESSION >/dev/null 2>&1
+    log "session ended, user manager environment restored"
+}
+trap restore_user_manager_environment EXIT
+trap 'exit 130' HUP INT TERM
+
+export ORBIT_SESSION=1
+export PATH="$ORBIT_PREFIX/bin:$PATH"
+export XDG_DATA_DIRS="$ORBIT_PREFIX/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+export RUST_LOG="${RUST_LOG:-cosmic_comp=info}"
+
+log "starting Orbit ($(head -n 1 "$ORBIT_PREFIX/share/orbit/build-info" 2>/dev/null || echo 'unknown build'))"
+# Not exec: this shell stays as the parent so the EXIT trap runs on logout.
+"$SESSION_LAUNCHER" --in-login-shell
+status=$?
+log "COSMIC session exited with status $status"
+exit "$status"

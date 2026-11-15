@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Write a problem report without personal details, show it, and offer to email it.
+# Usage: orbit-report [ERROR-CODE]
+# SPDX-License-Identifier: GPL-3.0-only
+set -uo pipefail
+
+here=$(dirname -- "$(readlink -f -- "$0")")
+for lib in "$here/../share/orbit/lib.sh" "$here/lib.sh"; do
+    # shellcheck source=lib.sh
+    [ -f "$lib" ] && { . "$lib"; break; }
+done
+command -v orbit_write_report >/dev/null 2>&1 || {
+    echo "Orbit's report helper is missing. Reinstall Orbit with session/install.sh." >&2
+    exit 1
+}
+
+code=${1:-ORB-R00}
+case "$code" in
+    -h|--help)
+        echo "Usage: orbit-report [ERROR-CODE]"
+        echo "Saves a report about Orbit's last session and install, with personal"
+        echo "details removed, then lets you read it and email it yourself."
+        exit 0 ;;
+esac
+
+detail="report requested by the user"
+if [ -f "$ORBIT_STATE/session.log" ]; then
+    last=$(grep -E "^[^ ]+ $code " "$ORBIT_STATE/session.log" | tail -n 1)
+    [ -n "$last" ] && detail=${last#* }
+fi
+file=$(orbit_write_report "$code" "Orbit problem report" "$detail")
+orbit_offer_report "$file" "$code"
