@@ -729,9 +729,7 @@ impl TilingLayout {
     }
 
     fn clear_transient_tree_state(tree: &mut Tree<Data>) -> Option<NodeId> {
-        let Some(root) = tree.root_node_id().cloned() else {
-            return None;
-        };
+        let root = tree.root_node_id().cloned()?;
         let mut grabbed_placeholder = None;
 
         for id in tree

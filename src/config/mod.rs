@@ -18,6 +18,7 @@ use cosmic_config::{ConfigGet, ConfigSet, CosmicConfigEntry};
 use cosmic_settings_config::window_rules::ApplicationException;
 use cosmic_settings_config::{Shortcuts, shortcuts, window_rules};
 use serde::{Deserialize, Serialize};
+use smithay::input::tablet::TabletSeatTrait;
 use smithay::wayland::xdg_activation::XdgActivationState;
 use smithay::{
     backend::input::InputTime,
@@ -835,11 +836,7 @@ fn quiesce_tiling_engine_interactions(state: &mut State) {
                         .is_some_and(|grab| matches!(grab, ResizeGrab::Tiling(_)))
             }) == Some(true)
         {
-            pointer.unset_grab(
-                state,
-                SERIAL_COUNTER.next_serial(),
-                state.common.clock.now().as_millis(),
-            );
+            pointer.unset_grab(state, SERIAL_COUNTER.next_serial(), InputTime::now());
         }
 
         if let Some(touch) = seat.get_touch()
@@ -851,6 +848,12 @@ fn quiesce_tiling_engine_interactions(state: &mut State) {
             }) == Some(true)
         {
             touch.unset_grab(state);
+        }
+
+        for tool in seat.tablet_seat().get_tools().into_values() {
+            if tool.with_grab(|_, grab| grab.is::<ResizeForkGrab>()) == Some(true) {
+                tool.unset_grab(state, SERIAL_COUNTER.next_serial(), InputTime::now());
+            }
         }
 
         if let Some(keyboard) = seat.get_keyboard()

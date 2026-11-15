@@ -4477,9 +4477,7 @@ impl Shell {
         workspace_handle: WorkspaceHandle,
         delta_x: f64,
     ) -> Option<bool> {
-        let Some(workspace) = self.active_space_mut(output) else {
-            return None;
-        };
+        let workspace = self.active_space_mut(output)?;
         if workspace.handle != workspace_handle
             || workspace.tiling_layer.mode() != TilingEngine::Scrolling
         {

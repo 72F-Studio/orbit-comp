@@ -220,6 +220,7 @@ impl TabletToolTarget<State> for ResizeForkTarget {
         let output = self.output.clone();
         let left_up_idx = self.left_up_idx;
         let orientation = self.orientation;
+        let scrolling_resize = self.scrolling_resize.clone();
         let serial = event.serial;
         let time = event.time;
         let tool = tool_descriptor.clone();
@@ -244,6 +245,7 @@ impl TabletToolTarget<State> for ResizeForkTarget {
                     orientation,
                     output,
                     ReleaseMode::NoMouseButtons,
+                    scrolling_resize,
                 ),
                 time,
                 serial,
@@ -851,6 +853,7 @@ impl TabletToolGrab<State> for ResizeForkGrab {
 
     fn unset(&mut self, data: &mut State) {
         self.update_location(data, self.last_loc.as_logical(), true);
+        self.finish_scrolling_resize(data);
     }
 
     fn proximity_in(
