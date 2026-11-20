@@ -86,30 +86,53 @@ orbit_write_report() {
     printf '%s\n' "$file"
 }
 
+# Whether prompts can be shown. Decided before output is redirected to the log.
+if [ -t 0 ] && [ -t 1 ]; then ORBIT_INTERACTIVE=true; else ORBIT_INTERACTIVE=false; fi
+
+# orbit_start_log FILE: copy all output to FILE as well as the terminal.
+# On exit, wait for the copies to finish so nothing prints after the prompt
+# comes back, which looks like the script hung.
+orbit_start_log() {
+    ORBIT_LOG=$1
+    : >"$ORBIT_LOG"
+    exec 3>&1 4>&2
+    exec > >(tee -a "$ORBIT_LOG" >&3)
+    _orbit_tee_out=$!
+    exec 2> >(tee -a "$ORBIT_LOG" >&4)
+    _orbit_tee_err=$!
+    trap _orbit_end_log EXIT
+}
+_orbit_end_log() {
+    exec 1>&3 2>&4
+    wait "$_orbit_tee_out" "$_orbit_tee_err" 2>/dev/null || true
+}
+
 # Let the user read the report, then open their mail client with it attached.
-# Nothing is ever uploaded by the script itself.
+# Nothing is ever uploaded by the script itself. Prompts talk to the terminal
+# directly, so they work while output is also going to the log.
 orbit_offer_report() {
     local file=$1 code=$2 answer
     orbit_note ""
     orbit_note "A report without personal details was saved to:"
     orbit_note "  $file"
-    [ -t 0 ] && [ -t 1 ] || return 0
-    printf 'Show the report now? [y/N] '
-    read -r answer || return 0
-    case "$answer" in y|Y|yes) "${PAGER:-less}" -- "$file" || cat -- "$file" ;; esac
-    if command -v xdg-email >/dev/null 2>&1; then
-        printf 'Open an email to the developer with this report attached? [y/N] '
-        read -r answer || return 0
-        case "$answer" in
-            y|Y|yes)
-                xdg-email --subject "Orbit problem report ($code)" \
-                    --body "What were you doing when this happened?" \
-                    --attach "$file" ${ORBIT_REPORT_EMAIL:+"$ORBIT_REPORT_EMAIL"} \
-                    >/dev/null 2>&1 \
-                    || orbit_note "Couldn't open your mail client. Attach the file above by hand."
-                ;;
-        esac
-    fi
+    [ "$ORBIT_INTERACTIVE" = true ] && [ -r /dev/tty ] && [ -w /dev/tty ] || return 0
+    printf 'Show the report now? [y/N] ' >/dev/tty
+    read -r answer </dev/tty || return 0
+    case "$answer" in
+        y|Y|yes) { "${PAGER:-less}" -- "$file" || cat -- "$file"; } </dev/tty >/dev/tty 2>&1 ;;
+    esac
+    command -v xdg-email >/dev/null 2>&1 || return 0
+    printf 'Open an email to the developer with this report attached? [y/N] ' >/dev/tty
+    read -r answer </dev/tty || return 0
+    case "$answer" in
+        y|Y|yes)
+            xdg-email --subject "Orbit problem report ($code)" \
+                --body "What were you doing when this happened?" \
+                --attach "$file" ${ORBIT_REPORT_EMAIL:+"$ORBIT_REPORT_EMAIL"} \
+                >/dev/null 2>&1 \
+                || orbit_note "Couldn't open your mail client. Attach the file above by hand."
+            ;;
+    esac
 }
 
 # orbit_fail CODE HEADLINE DESCRIPTION WHY
@@ -121,7 +144,7 @@ orbit_fail() {
         printf '\n%s%s✗ %s%s\n' "$_b" "$_r" "$headline" "$_n"
         printf '%s\n' "$description" | fold -s -w 78 | sed 's/^/  /'
         printf '\n  %s▸ Details: error %s%s\n' "$_d" "$code" "$_n"
-        [ -n "$why" ] && printf '%s\n' "$why" | orbit_redact | fold -s -w 74 | sed "s/^/    $_d/; s/\$/$_n/"
+        [ -n "$why" ] && printf '%s\n' "$why" | orbit_redact | sed "s/^/    $_d/; s/\$/$_n/"
     } >&2
     file=$(orbit_write_report "$code" "$headline" "$why")
     orbit_offer_report "$file" "$code" >&2

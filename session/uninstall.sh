@@ -38,9 +38,7 @@ case "$DESTDIR" in
 esac
 
 mkdir -p "$ORBIT_STATE"
-ORBIT_LOG=$ORBIT_STATE/uninstall.log
-: >"$ORBIT_LOG"
-exec > >(tee -a "$ORBIT_LOG") 2> >(tee -a "$ORBIT_LOG" >&2)
+orbit_start_log "$ORBIT_STATE/uninstall.log"
 
 [ "$(id -u)" -ne 0 ] || orbit_fail ORB-U03 "Don't run the uninstaller as root" \
     "Run it as your normal user; it asks for the administrator password itself when needed." \

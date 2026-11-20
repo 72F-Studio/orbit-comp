@@ -48,9 +48,7 @@ while [ "$#" -gt 0 ]; do
 done
 
 mkdir -p "$ORBIT_STATE"
-ORBIT_LOG=$ORBIT_STATE/install.log
-: >"$ORBIT_LOG"
-exec > >(tee -a "$ORBIT_LOG") 2> >(tee -a "$ORBIT_LOG" >&2)
+orbit_start_log "$ORBIT_STATE/install.log"
 orbit_note "Orbit install log: $ORBIT_LOG"
 
 # --- Preflight -----------------------------------------------------------
