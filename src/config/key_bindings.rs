@@ -21,6 +21,8 @@ pub enum PrivateAction {
     ToggleScratchLayer,
     /// Orbit: zoom out to see the whole strip.
     ToggleStripOverview,
+    /// Orbit: open the focused window's app at its current width from now on.
+    RememberWidth,
     Resizing(
         shortcuts::action::ResizeDirection,
         shortcuts::action::ResizeEdge,
@@ -48,9 +50,10 @@ pub fn center_scrolling_binding() -> shortcuts::Binding {
 /// number and PaperWM's Super+Escape scratch toggle use other keys).
 pub fn scrolling_bindings() -> Vec<(shortcuts::Binding, PrivateAction)> {
     use crate::shell::layout::scrolling::StripAction;
-    let bind = |shift: bool, key: Keysym| shortcuts::Binding {
+    let bind_with = |alt: bool, shift: bool, key: Keysym| shortcuts::Binding {
         modifiers: Modifiers {
             logo: true,
+            alt,
             shift,
             ..Modifiers::default()
         },
@@ -58,6 +61,18 @@ pub fn scrolling_bindings() -> Vec<(shortcuts::Binding, PrivateAction)> {
         key: Some(key),
         description: None,
     };
+    let bind = |shift: bool, key: Keysym| bind_with(false, shift, key);
+    const DIGITS: [Keysym; 9] = [
+        Keysym::_1,
+        Keysym::_2,
+        Keysym::_3,
+        Keysym::_4,
+        Keysym::_5,
+        Keysym::_6,
+        Keysym::_7,
+        Keysym::_8,
+        Keysym::_9,
+    ];
     vec![
         (
             center_scrolling_binding(),
@@ -108,7 +123,75 @@ pub fn scrolling_bindings() -> Vec<(shortcuts::Binding, PrivateAction)> {
             PrivateAction::ToggleScratchLayer,
         ),
         (bind(true, Keysym::o), PrivateAction::ToggleStripOverview),
+        (
+            bind(false, Keysym::bracketleft),
+            PrivateAction::Strip(StripAction::Squeeze(-1)),
+        ),
+        (
+            bind(false, Keysym::bracketright),
+            PrivateAction::Strip(StripAction::Squeeze(1)),
+        ),
+        (
+            bind_with(true, false, Keysym::w),
+            PrivateAction::RememberWidth,
+        ),
     ]
+    .into_iter()
+    .chain(DIGITS.iter().enumerate().flat_map(|(index, key)| {
+        [
+            (
+                bind_with(true, false, *key),
+                PrivateAction::Strip(StripAction::FocusIndex(index)),
+            ),
+            (
+                bind_with(true, true, *key),
+                PrivateAction::Strip(StripAction::MoveToIndex(index)),
+            ),
+        ]
+    }))
+    .collect()
+}
+
+/// Orbit: actions you can bind in COSMIC Settings, under Custom shortcuts,
+/// with the command `orbit <action>`. Orbit runs these itself instead of
+/// launching a program. Outside Orbit nothing is called `orbit`, so the
+/// shortcut does nothing.
+pub fn parse_orbit_command(command: &str) -> Option<PrivateAction> {
+    use crate::shell::layout::scrolling::StripAction;
+    let mut words = command.split_whitespace();
+    if words.next()? != "orbit" {
+        return None;
+    }
+    let action = words.next()?;
+    let rest = words.collect::<Vec<_>>();
+    // Either no argument, or exactly one column number starting at 1.
+    let number = match rest.as_slice() {
+        [] => None,
+        [word] => Some(word.parse::<usize>().ok().filter(|n| *n >= 1)?),
+        _ => return None,
+    };
+    let strip = PrivateAction::Strip;
+    Some(match (action, number) {
+        ("center", None) => PrivateAction::CenterScrollingColumn,
+        ("scroll-left", None) => strip(StripAction::ScrollView(-1)),
+        ("scroll-right", None) => strip(StripAction::ScrollView(1)),
+        ("focus-first", None) => strip(StripAction::FocusEdge(false)),
+        ("focus-last", None) => strip(StripAction::FocusEdge(true)),
+        ("move-column-left", None) => strip(StripAction::MoveColumn(-1)),
+        ("move-column-right", None) => strip(StripAction::MoveColumn(1)),
+        ("move-column-first", None) => strip(StripAction::MoveColumnToEdge(false)),
+        ("move-column-last", None) => strip(StripAction::MoveColumnToEdge(true)),
+        ("equalize", None) => strip(StripAction::Equalize),
+        ("expand", None) => strip(StripAction::Expand),
+        ("squeeze-left", None) => strip(StripAction::Squeeze(-1)),
+        ("squeeze-right", None) => strip(StripAction::Squeeze(1)),
+        ("focus-column", Some(n)) => strip(StripAction::FocusIndex(n - 1)),
+        ("move-to-column", Some(n)) => strip(StripAction::MoveToIndex(n - 1)),
+        ("scratch", None) => PrivateAction::ToggleScratchLayer,
+        ("overview", None) => PrivateAction::ToggleStripOverview,
+        ("remember-width", None) => PrivateAction::RememberWidth,
+        _ => return None,
+    })
 }
 
 /// Convert `cosmic_settings_config::shortcuts::State` to `smithay::backend::input::KeyState`.
@@ -148,6 +231,25 @@ pub fn cosmic_modifiers_from_smithay(value: ModifiersState) -> Modifiers {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn orbit_commands_parse() {
+        use crate::shell::layout::scrolling::StripAction;
+        assert_eq!(
+            parse_orbit_command("orbit focus-first"),
+            Some(PrivateAction::Strip(StripAction::FocusEdge(false)))
+        );
+        assert_eq!(
+            parse_orbit_command("  orbit   move-to-column 3 "),
+            Some(PrivateAction::Strip(StripAction::MoveToIndex(2)))
+        );
+        assert_eq!(parse_orbit_command("orbit focus-column 0"), None);
+        assert_eq!(parse_orbit_command("orbit focus-column"), None);
+        assert_eq!(parse_orbit_command("orbit overview extra"), None);
+        assert_eq!(parse_orbit_command("orbitx overview"), None);
+        assert_eq!(parse_orbit_command("firefox"), None);
+        assert_eq!(parse_orbit_command("orbit nonsense"), None);
+    }
 
     #[test]
     fn orbit_bindings_are_unique() {

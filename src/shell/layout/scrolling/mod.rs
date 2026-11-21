@@ -108,6 +108,14 @@ pub enum StripAction {
     Equalize,
     /// Widen the focused column into free screen space.
     Expand,
+    /// Focus the top window of column N (0-based).
+    FocusIndex(usize),
+    /// Move the focused column to position N (0-based), or the end if N is
+    /// past it.
+    MoveToIndex(usize),
+    /// Shrink the focused column and its left (-1) or right (1) neighbour so
+    /// both fit on screen together.
+    Squeeze(isize),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -476,6 +484,30 @@ impl ScrollingLayout {
         }
         self.model.ensure_visible(current);
         true
+    }
+
+    /// Orbit: the top tile of column `index`.
+    pub(super) fn index_tile(&self, index: usize) -> Option<NodeId> {
+        self.model.index_tile(index)
+    }
+
+    /// Orbit: move the focused column to position `index`.
+    pub(super) fn move_column_to_index(&mut self, current: &NodeId, index: usize) -> bool {
+        if !self.model.move_column_to_index(current, index) {
+            return false;
+        }
+        self.model.ensure_visible(current);
+        true
+    }
+
+    /// Orbit: fit the focused column and a neighbour on screen together.
+    pub(super) fn squeeze(&mut self, current: &NodeId, delta: isize) -> bool {
+        self.model.squeeze(current, delta)
+    }
+
+    /// Orbit: the focused column's width fraction.
+    pub(super) fn column_fraction(&self, current: &NodeId) -> Option<f64> {
+        self.model.column_fraction(current)
     }
 
     /// Orbit: equal widths for the columns on screen.
@@ -1635,6 +1667,74 @@ where
         }
         self.columns[focused].width = ColumnWidth::new(fraction);
         true
+    }
+
+    /// The top tile of column `index`, if there is one.
+    fn index_tile(&self, index: usize) -> Option<T> {
+        self.columns.get(index)?.tiles.first().cloned()
+    }
+
+    /// Move the column containing `current` to `index`, clamped to the end.
+    fn move_column_to_index(&mut self, current: &T, index: usize) -> bool {
+        let Some((column, _)) = self.tile_position(current) else {
+            return false;
+        };
+        let target = index.min(self.columns.len() - 1);
+        if target == column {
+            return false;
+        }
+        let moved = self.columns.remove(column);
+        self.columns.insert(target, moved);
+        self.focused = Some(current.clone());
+        true
+    }
+
+    /// Shrink the column holding `current` and its neighbour in `delta`'s
+    /// direction so they fit on screen side by side, keeping their width
+    /// ratio, then show both. Returns false when they already fit or there's
+    /// no neighbour.
+    fn squeeze(&mut self, current: &T, delta: isize) -> bool {
+        if self.viewport_width <= 0 {
+            return false;
+        }
+        let Some((focused, _)) = self.tile_position(current) else {
+            return false;
+        };
+        let Some(neighbour) = focused.checked_add_signed(delta.signum()) else {
+            return false;
+        };
+        if neighbour >= self.columns.len() {
+            return false;
+        }
+        let available = (self.viewport_width - self.gap) as f64;
+        let focused_px = self.column_width(focused) as f64;
+        let neighbour_px = self.column_width(neighbour) as f64;
+        if focused_px + neighbour_px <= available {
+            // They fit already; just bring the pair on screen.
+            self.focused = Some(current.clone());
+            self.user_positioned_viewport = false;
+            let old_viewport = self.viewport_x;
+            self.viewport_x = self.layout_x(focused.min(neighbour));
+            self.clamp_viewport();
+            return (self.viewport_x - old_viewport).abs() > f64::EPSILON;
+        }
+        let total = focused_px + neighbour_px;
+        let width = self.viewport_width as f64;
+        self.columns[focused].width =
+            ColumnWidth::new(clamp_fraction(available * focused_px / total / width));
+        self.columns[neighbour].width =
+            ColumnWidth::new(clamp_fraction(available * neighbour_px / total / width));
+        self.focused = Some(current.clone());
+        self.user_positioned_viewport = false;
+        self.viewport_x = self.layout_x(focused.min(neighbour));
+        self.clamp_viewport();
+        true
+    }
+
+    /// The width fraction of the column holding `current`.
+    fn column_fraction(&self, current: &T) -> Option<f64> {
+        let (column, _) = self.tile_position(current)?;
+        Some(self.columns[column].width.fraction)
     }
 
     fn move_tile_vertical(&mut self, current: &T, delta: isize) -> TileMove {
@@ -3992,5 +4092,62 @@ mod tests {
         assert!(model.expand_to_fill(&2));
         assert_eq!(width_fractions(&model), [0.25, 0.75]);
         assert!(!model.expand_to_fill(&2));
+    }
+
+    #[test]
+    fn columns_can_be_reached_and_moved_by_number() {
+        let mut model = four_half_columns(LayoutSettings::default());
+        assert_eq!(model.index_tile(2), Some(3));
+        assert_eq!(model.index_tile(9), None);
+        assert!(model.move_column_to_index(&1, 2));
+        assert_eq!(
+            tile_columns(&model),
+            vec![vec![2], vec![3], vec![1], vec![4]]
+        );
+        // Past the end means the end.
+        assert!(model.move_column_to_index(&1, 8));
+        assert_eq!(
+            tile_columns(&model),
+            vec![vec![2], vec![3], vec![4], vec![1]]
+        );
+        assert!(!model.move_column_to_index(&1, 3));
+    }
+
+    #[test]
+    fn squeeze_fits_a_neighbour_on_screen_keeping_the_ratio() {
+        let mut model = ColumnModel {
+            columns: vec![
+                Column {
+                    tiles: vec![1],
+                    width: ColumnWidth::new(0.75),
+                },
+                Column {
+                    tiles: vec![2],
+                    width: ColumnWidth::new(0.75),
+                },
+                Column {
+                    tiles: vec![3],
+                    width: ColumnWidth::new(0.5),
+                },
+            ],
+            ..Default::default()
+        };
+        model.viewport_width = 1_000;
+        model.gap = 0;
+        assert!(model.squeeze(&1, 1));
+        assert_eq!(width_fractions(&model), [0.5, 0.5, 0.5]);
+        assert_viewport(&model, 0.0);
+        // No neighbour on the left of the first column.
+        assert!(!model.squeeze(&1, -1));
+    }
+
+    #[test]
+    fn squeeze_only_scrolls_when_the_pair_already_fits() {
+        let mut model = four_half_columns(LayoutSettings::default());
+        model.gap = 0;
+        model.viewport_x = 250.0;
+        assert!(model.squeeze(&2, 1));
+        assert_eq!(width_fractions(&model), [0.5; 4]);
+        assert_viewport(&model, 500.0);
     }
 }

@@ -4490,6 +4490,14 @@ impl Shell {
             .flatten()
     }
 
+    /// Orbit: the focused scrolling window's app ID and column width.
+    pub fn scrolling_focused_width(&self, seat: &Seat<State>) -> Option<(String, f64)> {
+        let output = seat.focused_output()?;
+        self.active_space(&output)?
+            .tiling_layer
+            .scrolling_focused_width(seat)
+    }
+
     /// Orbit: PaperWM-style scratch layer. Hides the floating windows of the
     /// focused workspace by minimizing them, or brings back the ones it hid.
     pub fn toggle_scratch_layer(

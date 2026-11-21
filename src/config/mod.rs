@@ -84,7 +84,7 @@ pub struct Config {
 
 /// Orbit: push the Scrolling settings that rendering and layout read
 /// directly. Focus-follows-scroll is read from the config where it's used.
-fn apply_scrolling_config(scrolling: &ScrollingConfig) {
+pub(crate) fn apply_scrolling_config(scrolling: &ScrollingConfig) {
     use crate::shell::layout::scrolling::{LayoutSettings, set_layout_settings};
     set_layout_settings(
         LayoutSettings {

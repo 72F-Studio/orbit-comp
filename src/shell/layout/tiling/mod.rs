@@ -2069,6 +2069,18 @@ impl TilingLayout {
         self.push_scrolling_animation(tree, blocker);
     }
 
+    /// Orbit: the focused window's app ID and column width fraction, for the
+    /// remember-width shortcut.
+    pub fn scrolling_focused_width(&self, seat: &Seat<State>) -> Option<(String, f64)> {
+        let node_id = self.scrolling_focused_tile(seat)?;
+        let fraction = self.scrolling.column_fraction(&node_id)?;
+        let app_id = match self.tree().get(&node_id).ok()?.data() {
+            Data::Mapped { mapped, .. } => mapped.active_window().app_id(),
+            _ => return None,
+        };
+        (!app_id.is_empty()).then_some((app_id, fraction))
+    }
+
     /// Orbit: strip position for the indicator; see `ScrollingLayout::strip_metrics`.
     pub fn scrolling_strip_metrics(&self) -> Option<(f64, i32, f64)> {
         if self.tiling_engine != TilingEngine::Scrolling {
@@ -2115,6 +2127,19 @@ impl TilingLayout {
                 focused
                     .as_ref()
                     .is_some_and(|tile| self.scrolling.expand_to_fill(tile)),
+                None,
+            ),
+            StripAction::FocusIndex(index) => (false, self.scrolling.index_tile(index)),
+            StripAction::MoveToIndex(index) => (
+                focused
+                    .as_ref()
+                    .is_some_and(|tile| self.scrolling.move_column_to_index(tile, index)),
+                None,
+            ),
+            StripAction::Squeeze(delta) => (
+                focused
+                    .as_ref()
+                    .is_some_and(|tile| self.scrolling.squeeze(tile, delta)),
                 None,
             ),
         };

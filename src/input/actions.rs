@@ -136,6 +136,25 @@ impl State {
                     .toggle_scratch_layer(seat, &loop_handle);
             }
 
+            Action::Private(PrivateAction::RememberWidth) => {
+                let focused = self.common.shell.read().scrolling_focused_width(seat);
+                if let Some((app_id, width)) = focused {
+                    let scrolling = &mut self.common.config.cosmic_conf.scrolling;
+                    scrolling
+                        .width_rules
+                        .retain(|rule| !rule.app_id.eq_ignore_ascii_case(&app_id));
+                    scrolling.width_rules.push(cosmic_comp_config::WidthRule {
+                        app_id,
+                        width: (width * 100.0).round() / 100.0,
+                    });
+                    let scrolling = scrolling.clone();
+                    crate::config::apply_scrolling_config(&scrolling);
+                    if let Err(err) = self.common.config.cosmic_helper.set("scrolling", scrolling) {
+                        tracing::warn!(?err, "Failed to save the remembered window width");
+                    }
+                }
+            }
+
             Action::Private(PrivateAction::ToggleStripOverview) => {
                 crate::backend::render::scrolling_backdrop::toggle_strip_overview();
                 if let Some(output) = seat.focused_output() {
@@ -1092,7 +1111,24 @@ impl State {
                 }
             }
 
-            Action::Spawn(command) => self.spawn_command(command),
+            Action::Spawn(command) => {
+                // Orbit: "orbit <action>" custom shortcuts run Orbit actions.
+                if let Some(action) = crate::config::key_bindings::parse_orbit_command(&command) {
+                    if self.common.shell.read().scrolling_workspace_active(seat) {
+                        self.handle_action(
+                            crate::config::Action::Private(action),
+                            backend_id,
+                            seat,
+                            serial,
+                            time,
+                            pattern,
+                            direction,
+                        );
+                    }
+                } else {
+                    self.spawn_command(command)
+                }
+            }
 
             x @ Action::ZoomIn | x @ Action::ZoomOut => {
                 let change = {
