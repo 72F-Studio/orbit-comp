@@ -32,6 +32,7 @@ That project describes itself as an unmaintained proof of concept and invites
 forks. According to its README, it was AI-generated (GPT 5.6 Sol) step by step
 and tested by its author. The import commit keeps miguel-das as its author.
 
-The companion panel applet lives in the `orbit-applets` fork of
-[cosmic-applets](https://github.com/pop-os/cosmic-applets), and has the same
-origin.
+The companion panel applet lives in
+[72F-Studio/orbit-applets](https://github.com/72F-Studio/orbit-applets), a
+fork of [cosmic-applets](https://github.com/pop-os/cosmic-applets) with the
+same origin.

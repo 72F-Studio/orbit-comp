@@ -4,9 +4,10 @@
 ORBIT_OWNER_ID=orbit-session-v1
 ORBIT_OWNER_LINE="X-OrbitOwner=$ORBIT_OWNER_ID"
 
-# Where problem reports are sent. Left empty, the mail client opens with no
-# recipient filled in and the user picks one.
+# Where problem reports go. With no email address set, reports are attached
+# to a GitHub issue by the user. Set ORBIT_REPORT_EMAIL to offer email instead.
 ORBIT_REPORT_EMAIL=${ORBIT_REPORT_EMAIL-}
+ORBIT_ISSUES_URL=https://github.com/72F-Studio/orbit-comp/issues/new
 
 ORBIT_DATA=${XDG_DATA_HOME:-$HOME/.local/share}/orbit
 ORBIT_PREFIX=$ORBIT_DATA/prefix
@@ -107,7 +108,8 @@ _orbit_end_log() {
     wait "$_orbit_tee_out" "$_orbit_tee_err" 2>/dev/null || true
 }
 
-# Let the user read the report, then open their mail client with it attached.
+# Let the user read the report, then help them send it: a GitHub issue by
+# default, or their mail client when ORBIT_REPORT_EMAIL is set.
 # Nothing is ever uploaded by the script itself. Prompts talk to the terminal
 # directly, so they work while output is also going to the log.
 orbit_offer_report() {
@@ -121,16 +123,32 @@ orbit_offer_report() {
     case "$answer" in
         y|Y|yes) { "${PAGER:-less}" -- "$file" || cat -- "$file"; } </dev/tty >/dev/tty 2>&1 ;;
     esac
-    command -v xdg-email >/dev/null 2>&1 || return 0
-    printf 'Open an email to the developer with this report attached? [y/N] ' >/dev/tty
+    if [ -n "$ORBIT_REPORT_EMAIL" ]; then
+        command -v xdg-email >/dev/null 2>&1 || return 0
+        printf 'Open an email to the developer with this report attached? [y/N] ' >/dev/tty
+        read -r answer </dev/tty || return 0
+        case "$answer" in
+            y|Y|yes)
+                xdg-email --subject "Orbit problem report ($code)" \
+                    --body "What were you doing when this happened?" \
+                    --attach "$file" "$ORBIT_REPORT_EMAIL" >/dev/null 2>&1 \
+                    || orbit_note "Couldn't open your mail client. Attach the file above by hand."
+                ;;
+        esac
+        return 0
+    fi
+    # No developer address: report through a GitHub issue. Only the error
+    # code goes in the link; the user attaches the file themselves.
+    orbit_note ""
+    orbit_note "To report it, open an issue and attach the file above:"
+    orbit_note "  $ORBIT_ISSUES_URL"
+    command -v xdg-open >/dev/null 2>&1 || return 0
+    printf 'Open the new-issue page in your browser? [y/N] ' >/dev/tty
     read -r answer </dev/tty || return 0
     case "$answer" in
         y|Y|yes)
-            xdg-email --subject "Orbit problem report ($code)" \
-                --body "What were you doing when this happened?" \
-                --attach "$file" ${ORBIT_REPORT_EMAIL:+"$ORBIT_REPORT_EMAIL"} \
-                >/dev/null 2>&1 \
-                || orbit_note "Couldn't open your mail client. Attach the file above by hand."
+            xdg-open "$ORBIT_ISSUES_URL?title=Orbit+problem+report+($code)" >/dev/null 2>&1 \
+                || orbit_note "Couldn't open a browser. Open the address above by hand."
             ;;
     esac
 }

@@ -133,8 +133,9 @@ so changes you make in one session appear in the other.
   ```
 
   It saves a report with your user name, home folder, host name, email
-  addresses and window titles removed, lets you read it, and offers to open an
-  email with it attached. Nothing is sent unless you send that email yourself.
+  addresses and window titles removed, lets you read it, and offers to open a
+  new GitHub issue for you to attach it to. Nothing is uploaded unless you
+  attach it yourself.
 
 Logs are in `~/.local/state/orbit/`: `install.log`, `uninstall.log` and
 `session.log`.
