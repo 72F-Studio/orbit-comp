@@ -201,6 +201,12 @@ Logs are in `~/.local/state/orbit/`: `install.log`, `uninstall.log` and
 | ORB-U02 | Removing Orbit's files failed                                 |
 | ORB-U03 | The uninstaller was run as root                               |
 | ORB-U04 | The uninstaller was run inside an Orbit session               |
+| ORB-C01 | Corners applet: a bar's settings store couldn't be opened |
+| ORB-C02 | Corners applet: a bar's corner radius couldn't be read     |
+| ORB-C03 | Corners applet: writing a bar's corner radius failed       |
+| ORB-C04 | Corners applet: saving its own pinned values failed        |
+| ORB-C05 | Corners applet: a theme settings store couldn't be opened  |
+| ORB-C06 | Corners applet: reading or writing theme corners failed    |
 
 Codes are stable: a code always keeps its meaning, and a removed code is
 never reused.

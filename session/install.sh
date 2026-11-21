@@ -103,6 +103,11 @@ profile_flag=()
 
 COMP_BIN="$COMP_ROOT/target/$PROFILE/cosmic-comp"
 APPLET_BIN="$APPLETS_DIR/target/$PROFILE/cosmic-applet-tiling"
+# Optional: older orbit-applets checkouts don't have the Dock Corners applet.
+CORNERS_SRC="$APPLETS_DIR/orbit-applet-corners"
+CORNERS_BIN="$APPLETS_DIR/target/$PROFILE/orbit-applet-corners"
+applet_packages=(-p cosmic-applet-tiling)
+[ -f "$CORNERS_SRC/Cargo.toml" ] && applet_packages+=(-p orbit-applet-corners)
 
 if [ "$BUILD" = true ]; then
     orbit_step "Building the Orbit compositor ($PROFILE)"
@@ -112,11 +117,11 @@ if [ "$BUILD" = true ]; then
             "Compiling Orbit's compositor failed. Make sure the build libraries are installed (on Arch-based systems: sudo pacman -S --needed base-devel libinput libxkbcommon mesa libdisplay-info seatd pixman), then try again. The compiler output above says which part failed." \
             "cargo build exited with status $? (profile $PROFILE)"
     if [ "$APPLET" = true ]; then
-        orbit_step "Building the Window Layout applet ($PROFILE)"
-        cargo build --locked "${profile_flag[@]}" --manifest-path "$APPLETS_DIR/Cargo.toml" -p cosmic-applet-tiling \
+        orbit_step "Building the panel applets ($PROFILE)"
+        cargo build --locked "${profile_flag[@]}" --manifest-path "$APPLETS_DIR/Cargo.toml" "${applet_packages[@]}" \
             || orbit_fail ORB-I05 "The Window Layout applet didn't build" \
                 "Compiling the panel applet failed. You can install without it using --no-applet; the panel then keeps COSMIC's own layout applet." \
-                "cargo build -p cosmic-applet-tiling exited with status $? (profile $PROFILE)"
+                "cargo build ${applet_packages[*]} exited with status $? (profile $PROFILE)"
     fi
 fi
 
@@ -155,6 +160,13 @@ install_prefix() {
             >"$stage/share/applications/com.system76.CosmicAppletTiling.desktop" || return 1
         install -m 0644 "$src"/icons/scalable/apps/com.system76.CosmicAppletTiling*.svg \
             "$stage/share/icons/hicolor/scalable/apps/" || return 1
+        if [ -x "$CORNERS_BIN" ]; then
+            install -m 0755 "$CORNERS_BIN" "$stage/bin/orbit-applet-corners" || return 1
+            grep -v '^Categories=COSMIC;$' "$CORNERS_SRC/data/com.studio72f.OrbitCorners.desktop" \
+                >"$stage/share/applications/com.studio72f.OrbitCorners.desktop" || return 1
+            install -m 0644 "$CORNERS_SRC"/data/icons/scalable/apps/com.studio72f.OrbitCorners*.svg \
+                "$stage/share/icons/hicolor/scalable/apps/" || return 1
+        fi
     fi
     {
         echo "$ORBIT_DESCRIBE"
