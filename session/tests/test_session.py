@@ -128,6 +128,18 @@ class SessionScripts(unittest.TestCase):
         self.assertIn("ORB-I08", result.stderr)
         self.assertEqual(desktop.read_text(), "[Desktop Entry]\nName=Someone else\n")
 
+    def test_empty_leftover_session_files_are_replaced(self):
+        launcher = self.stage / "usr/local/bin/orbit-session"
+        desktop = self.stage / "usr/share/wayland-sessions/orbit.desktop"
+        for path in (launcher, desktop):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("")
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(OWNER, desktop.read_text())
+        self.assertGreater(launcher.stat().st_size, 0)
+        self.assertEqual(list(launcher.parent.glob("*.orbit-new")), [])
+
     def test_refuses_a_foreign_orbit_folder(self):
         (self.home / ".local/share/orbit").mkdir(parents=True)
         (self.home / ".local/share/orbit/mine.txt").write_text("keep")

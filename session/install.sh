@@ -210,8 +210,12 @@ if [ -z "$DESTDIR" ]; then
     as_root=(sudo --)
 fi
 {
-    "${as_root[@]}" install -D -m 0755 "$SESSION_DIR/orbit-session" "$launcher" \
-        && "${as_root[@]}" install -D -m 0644 "$SESSION_DIR/orbit.desktop" "$desktop"
+    # Write next to the target and rename, so an interrupted install never
+    # leaves a half-written launcher for the login screen to run.
+    "${as_root[@]}" install -D -m 0755 "$SESSION_DIR/orbit-session" "$launcher.orbit-new" \
+        && "${as_root[@]}" mv -f -- "$launcher.orbit-new" "$launcher" \
+        && "${as_root[@]}" install -D -m 0644 "$SESSION_DIR/orbit.desktop" "$desktop.orbit-new" \
+        && "${as_root[@]}" mv -f -- "$desktop.orbit-new" "$desktop"
 } || orbit_fail ORB-I09 "Orbit couldn't be added to the login screen" \
     "Orbit is installed for your account, but the login screen entry wasn't added. This usually means the administrator password was cancelled or wrong. Run the installer again to retry." \
     "installing $launcher or $desktop failed"

@@ -159,6 +159,9 @@ orbit_warn() {
 }
 
 # True when PATH is a regular file carrying the Orbit ownership marker.
+# An empty regular file also counts: it holds nothing to lose, and is what an
+# interrupted install leaves behind.
 orbit_owned_file() {
-    [ -f "$1" ] && [ ! -L "$1" ] && grep -qF "$ORBIT_OWNER_LINE" -- "$1"
+    [ -f "$1" ] && [ ! -L "$1" ] || return 1
+    [ ! -s "$1" ] || grep -qF "$ORBIT_OWNER_LINE" -- "$1"
 }
