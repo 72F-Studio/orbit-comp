@@ -76,8 +76,9 @@ workspace with **Super+Y** or the Window Layout applet. Then:
 | Super+Alt+1–9 | Focus column 1–9 |
 | Super+Alt+Shift+1–9 | Move the focused column to position 1–9 |
 | Super+Alt+W | Open the focused window's app at its current width from now on |
+| Super+Alt+C | Cycle this workspace's scrolling: as needed, centre, centre if hidden, then back to your global setting. Lasts until you log out |
 | Super+` | Hide or show the workspace's floating windows (scratch layer) |
-| Super+Shift+O | Overview: zoom out to see the whole strip. Click a window to go to it; Escape closes it |
+| Super+Shift+O | Overview: zoom out to see the whole strip. Click a window to go to it; Escape closes it. Windows don't react to hover while it's open |
 | Three-finger swipe sideways | Pan the strip |
 
 Orbit's own shortcuts only apply on tiled scrolling workspaces, and never
@@ -104,6 +105,7 @@ Orbit's default keys, give that key a different shortcut there.
 | `orbit remember-width` | Keep the focused app's current width |
 | `orbit scratch` | Hide or show floating windows |
 | `orbit overview` | Toggle the overview |
+| `orbit centering` | Cycle this workspace's centering |
 
 The applet switches between **Floating**, **Tiling** (COSMIC's classic layout)
 and **Scrolling**, for the current workspace and for new workspaces. The

@@ -135,6 +135,10 @@ pub fn scrolling_bindings() -> Vec<(shortcuts::Binding, PrivateAction)> {
             bind_with(true, false, Keysym::w),
             PrivateAction::RememberWidth,
         ),
+        (
+            bind_with(true, false, Keysym::c),
+            PrivateAction::Strip(StripAction::CycleCentering),
+        ),
     ]
     .into_iter()
     .chain(DIGITS.iter().enumerate().flat_map(|(index, key)| {
@@ -190,6 +194,7 @@ pub fn parse_orbit_command(command: &str) -> Option<PrivateAction> {
         ("scratch", None) => PrivateAction::ToggleScratchLayer,
         ("overview", None) => PrivateAction::ToggleStripOverview,
         ("remember-width", None) => PrivateAction::RememberWidth,
+        ("centering", None) => strip(StripAction::CycleCentering),
         _ => return None,
     })
 }

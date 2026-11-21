@@ -3108,7 +3108,13 @@ impl State {
             .map(|((w, start), idx)| (w.handle, idx, start));
         let workspace = (workspace.handle, idx);
 
-        let element_filter = if workspace_overview_is_open(output) {
+        // Orbit: while the strip overview is shown, windows are drawn zoomed
+        // out, so hovering them at their normal positions would point at the
+        // wrong window. Only layer surfaces (panels) take the pointer then;
+        // a click is handled separately and focuses the zoomed window.
+        let element_filter = if workspace_overview_is_open(output)
+            || crate::backend::render::scrolling_backdrop::strip_overview_open()
+        {
             ElementFilter::LayerShellOnly
         } else {
             ElementFilter::All

@@ -29,14 +29,16 @@ M medium, L large.
 - Every Orbit action can be rebound in COSMIC Settings as an `orbit ...`
   custom shortcut.
 - Collapsible Scrolling section in the applet.
+- Per-workspace centering (Super+Alt+C), until logout.
+- The overview ignores hover, so the pointer never points at the wrong window.
 - Tabbed columns, through COSMIC's existing window stacks (Super+S).
 
 ## Next
 
 | Feature | Notes | Effort |
 |---|---|---|
-| Hover in the overview | Pointer motion still goes to the unzoomed positions; only clicks are mapped | S |
-| Per-workspace centering mode | PaperWM lets each workspace pick its own | M |
+| Show the workspace's centering mode | An on-screen hint when Super+Alt+C changes it | S |
+| Keep per-workspace centering across logins | Needs stable workspace identities | M |
 | Orbit page in COSMIC Settings | Needs a fork of pop-os/cosmic-settings; the applet covers the same settings | L |
 
 ## Maintenance

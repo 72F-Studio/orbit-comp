@@ -116,6 +116,8 @@ pub enum StripAction {
     /// Shrink the focused column and its left (-1) or right (1) neighbour so
     /// both fit on screen together.
     Squeeze(isize),
+    /// Cycle this workspace's centering policy (PaperWM focus modes).
+    CycleCentering,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,6 +167,9 @@ pub(super) enum ColumnDropTarget<T> {
 pub(super) struct ScrollingLayout {
     model: ColumnModel<NodeId>,
     pending_center: Option<NodeId>,
+    /// Orbit: this workspace's centering policy, if it differs from the
+    /// global setting. Set with Super+Alt+C; lasts until logout.
+    centering_override: Option<CenteringPolicy>,
 }
 
 impl Default for ScrollingLayout {
@@ -178,6 +183,7 @@ impl ScrollingLayout {
         Self {
             model: ColumnModel::default(),
             pending_center: None,
+            centering_override: None,
         }
     }
 
@@ -247,7 +253,7 @@ impl ScrollingLayout {
         preserve_viewport: bool,
         live_resize: Option<(&[NodeId], bool)>,
     ) -> Option<TilingBlocker> {
-        self.model.settings = layout_settings();
+        self.refresh_settings();
         let requested_center = self.pending_center.take();
         let preserved_viewport = preserve_viewport.then_some(self.model.viewport_x);
         let Some(root_id) = tree.root_node_id().cloned() else {
@@ -458,6 +464,29 @@ impl ScrollingLayout {
         ))
     }
 
+    /// Orbit: copy the global settings into the model, with this workspace's
+    /// centering override on top.
+    fn refresh_settings(&mut self) {
+        self.model.settings = layout_settings();
+        if let Some(centering) = self.centering_override {
+            self.model.settings.centering = centering;
+        }
+    }
+
+    /// Orbit: step this workspace's centering through Lazy, Always,
+    /// OnOverflow and back to the global setting (`None`). Returns the new
+    /// override.
+    pub(super) fn cycle_centering_override(&mut self) -> Option<CenteringPolicy> {
+        self.centering_override = match self.centering_override {
+            None => Some(CenteringPolicy::Lazy),
+            Some(CenteringPolicy::Lazy) => Some(CenteringPolicy::Always),
+            Some(CenteringPolicy::Always) => Some(CenteringPolicy::OnOverflow),
+            Some(CenteringPolicy::OnOverflow) => None,
+        };
+        self.refresh_settings();
+        self.centering_override
+    }
+
     /// Orbit: scroll the view one column without moving focus.
     pub(super) fn scroll_by_column(&mut self, delta: isize) -> bool {
         self.model.scroll_by_column(delta)
@@ -661,7 +690,7 @@ impl ScrollingLayout {
         focused: Option<&NodeId>,
         fraction: Option<f64>,
     ) {
-        self.model.settings = layout_settings();
+        self.refresh_settings();
         let fraction = fraction.unwrap_or(self.model.settings.new_column_fraction);
         self.model
             .insert_new_toplevel_with_width(tile, focused, fraction);
@@ -3562,6 +3591,7 @@ mod tests {
                 ..ColumnModel::default()
             },
             pending_center: None,
+            centering_override: None,
         };
         scrolling.model.set_metrics(1_340, 10);
 
@@ -3628,6 +3658,7 @@ mod tests {
                 ..ColumnModel::default()
             },
             pending_center: None,
+            centering_override: None,
         };
         scrolling.model.set_metrics(1_340, 10);
         scrolling.model.set_column_height(800);
@@ -4149,5 +4180,25 @@ mod tests {
         assert!(model.squeeze(&2, 1));
         assert_eq!(width_fractions(&model), [0.5; 4]);
         assert_viewport(&model, 500.0);
+    }
+
+    #[test]
+    fn per_workspace_centering_cycles_back_to_the_global_setting() {
+        let mut layout = ScrollingLayout::new();
+        assert_eq!(
+            layout.cycle_centering_override(),
+            Some(CenteringPolicy::Lazy)
+        );
+        assert_eq!(
+            layout.cycle_centering_override(),
+            Some(CenteringPolicy::Always)
+        );
+        assert_eq!(layout.model.settings.centering, CenteringPolicy::Always);
+        assert_eq!(
+            layout.cycle_centering_override(),
+            Some(CenteringPolicy::OnOverflow)
+        );
+        assert_eq!(layout.cycle_centering_override(), None);
+        assert_eq!(layout.model.settings.centering, layout_settings().centering);
     }
 }

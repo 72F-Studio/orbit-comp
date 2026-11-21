@@ -2142,6 +2142,15 @@ impl TilingLayout {
                     .is_some_and(|tile| self.scrolling.squeeze(tile, delta)),
                 None,
             ),
+            StripAction::CycleCentering => {
+                let policy = self.scrolling.cycle_centering_override();
+                tracing::info!(?policy, "Orbit: workspace centering changed");
+                // Apply it right away to the focused column.
+                let moved = focused
+                    .as_ref()
+                    .is_some_and(|tile| self.scrolling.ensure_visible(tile));
+                (moved, None)
+            }
         };
         if changed {
             let gaps = self.gaps();

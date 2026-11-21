@@ -13,6 +13,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 import unittest
 
 SESSION = Path(__file__).resolve().parents[1]
@@ -241,6 +242,14 @@ class SessionScripts(unittest.TestCase):
         self.assertNotIn(str(self.prefix), started["PATH"])
         log = (self.home / ".local/state/orbit/session.log").read_text()
         self.assertIn("ORB-S01", log)
+        # The notification is sent from a background process; wait for it so
+        # it can't write into the temp folder while it's being removed.
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if self.calls.exists() and "notify-send" in self.calls.read_text():
+                break
+            time.sleep(0.05)
+        self.assertIn("ORB-S01", self.calls.read_text())
 
     def test_launcher_runs_cosmic_with_orbit_first_and_restores_on_exit(self):
         self.assertEqual(self.install().returncode, 0)
