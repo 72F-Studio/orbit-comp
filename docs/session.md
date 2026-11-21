@@ -106,7 +106,8 @@ While the engine is Scrolling, the applet also shows:
 ```
 
 Fields you leave out keep their defaults. App IDs match exactly, ignoring
-case; `cosmic-toplevel` or COSMIC's window-management settings show them.
+case. An app's ID is usually its `.desktop` file name without the extension
+(for example `org.kde.kate` for `/usr/share/applications/org.kde.kate.desktop`).
 
 They're stored together in the `scrolling` key next to `tiling_engine`.
 
