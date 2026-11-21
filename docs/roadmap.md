@@ -9,30 +9,32 @@ M medium, L large.
 ## Done
 
 - Backdrop blur behind scrolling workspaces.
-- New-window width presets (25/50/75/90%) and custom width.
+- New-window width presets (25/50/75/90%), custom width and per-app width
+  rules (config file only so far).
 - Focus follows scroll (opt-in, with a threshold).
 - Maximize widens the column instead of floating the window.
+- Centering policy (lazy, always, on overflow) and centring a lone column.
+- New window position (next to focused, or at the end).
+- Scroll the view by a column; focus first/last column.
+- Move whole columns left/right and to the start/end.
+- Equalize visible columns; expand to fill free space.
+- Dim partly off-screen windows.
+- Scratch layer toggle for floating windows.
+- Strip position indicator.
+- Focus crosses to the next monitor at the strip's edge.
+- Strip overview (view-only).
+- Tabbed columns, through COSMIC's existing window stacks (Super+S).
 
 ## Next
 
-| # | Feature | Seen in | Effort |
-|---|---|---|---|
-| 1 | **Centering policy** as a setting: only scroll as needed (current), always centre the focused column, or centre when it fits. Plus "centre a lone window" | Karousel `scrollingLazy` / `scrollingCentered` / `scrollingGrouped`; PaperWM focus modes; niri `center-focused-column` | S |
-| 2 | **New window position**: right of focused (current) or end of strip | PaperWM `open-window-position` | S |
-| 3 | **Keyboard and mouse-wheel scrolling** of the view without moving focus; first/last column on Super+Home/End | Karousel Meta+Alt+PgUp/PgDn, Home/End | S |
-| 4 | **Move whole columns** left/right and to start/end | Karousel Meta+Ctrl+Shift+arrows | S |
-| 5 | **Focus or move by index**: Super+N, Super+Shift+N | Karousel | S |
-| 6 | **Squeeze and equalize**: fit the neighbour on screen, equalize visible widths, expand to fill | Karousel Meta+Ctrl+A/D/X; niri `expand-column-to-available-width` | S–M |
-| 7 | **Dim off-screen windows** | Karousel `offScreenOpacity` | S |
-| 8 | **Tabbed columns**: show one window of a column, the rest as tabs | Karousel Meta+X; niri tabbed display | M |
-| 9 | **Window rules**: always float, or open at a set width, by app ID or title | Karousel `windowRules`; PaperWM winprops `preferredWidth` | M |
-| 10 | **Scratch layer** toggle per workspace | PaperWM Super+Escape | M |
-| 11 | **Strip position indicator** in the panel applet | PaperWM window position bar | M |
-| 12 | **Multi-monitor**: focus and move across the output edge | PaperWM | M |
-| 13 | **Overview / zoom-out** of the whole strip | niri, PaperWM minimap | L |
-
-Dialogs and transients already float centred on their parent through
-COSMIC's existing dialog handling.
+| Feature | Notes | Effort |
+|---|---|---|
+| Clickable overview | Map pointer input through the overview transform, so a click focuses a window | M |
+| Applet editor for width rules | Add "open this app at its current width" to the applet | M |
+| Focus or move by number | Super+1-9 belong to workspaces; needs another modifier, such as Super+Alt+1-9 | S |
+| Squeeze a neighbour on screen | Karousel Meta+Ctrl+A/D | S |
+| Per-workspace centering mode | PaperWM lets each workspace pick its own | M |
+| Popup height | The applet popup is long while Scrolling is on; consider a scrollable or collapsible section | S |
 
 ## Maintenance
 

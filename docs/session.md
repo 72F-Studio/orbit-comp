@@ -49,13 +49,28 @@ Useful options: `--build-only` (no login screen entry and no password),
 On your first Orbit login, tiled workspaces scroll. Turn tiling on for a
 workspace with **Super+Y** or the Window Layout applet. Then:
 
-| Keys                            | Action                                       |
-|---------------------------------|----------------------------------------------|
-| Super+Left / Super+Right        | Focus the column to the left or right        |
-| Super+Shift+Left / Right        | Move the window to the left or right         |
+| Keys | Action |
+|---|---|
+| Super+Left / Super+Right | Focus the column to the left or right. At the edge, focus moves to the next monitor |
+| Super+Shift+Left / Right | Move the window left or right |
 | Super+Ctrl+Up / Super+Ctrl+Down | Switch workspace (stacked vertically while scrolling) |
-| Super+C                         | Centre the focused column                    |
-| Three-finger swipe sideways     | Pan the strip of columns                     |
+| Super+C | Centre the focused column |
+| Super+R / Super+Shift+R | Cycle the column width up or down |
+| Super+M | Toggle the column between full width and its previous width |
+| Super+S | Turn the window into a tabbed stack; new windows join it |
+| Super+PageUp / PageDown | Scroll the view one column, focus stays |
+| Super+Home / End | Focus the first or last column |
+| Super+Shift+PageUp / PageDown | Move the whole column left or right |
+| Super+Shift+Home / End | Move the whole column to the start or end |
+| Super+E | Give the columns on screen equal widths |
+| Super+Shift+E | Widen the focused column into free space |
+| Super+` | Hide or show the workspace's floating windows (scratch layer) |
+| Super+Shift+O | Overview: zoom out to see the whole strip. Escape closes it |
+| Three-finger swipe sideways | Pan the strip |
+
+Orbit's own shortcuts only apply on tiled scrolling workspaces, and never
+override a shortcut you set in COSMIC Settings. The overview is view-only for
+now: clicks go to the windows' normal positions.
 
 The applet switches between **Floating**, **Tiling** (COSMIC's classic layout)
 and **Scrolling**, for the current workspace and for new workspaces. The
@@ -71,6 +86,27 @@ While the engine is Scrolling, the applet also shows:
 | Focus the window you scroll to | A touchpad pan focuses the window it scrolls into, once enough of it is on screen | Off |
 | Once this much of it is on screen | How much of that window must be visible first | 60% |
 | Blur the desktop behind windows | Blurs the wallpaper and desktop icons behind a scrolling workspace | On |
+| When focus moves | Scroll as needed, always centre the focused column, or centre it only if it was hidden | Scroll as needed |
+| New windows open | Next to the focused window, or at the end of the strip | Next to focused |
+| Centre a lone window | A workspace with one narrower window shows it mid-screen | Off |
+| Dim windows partly off screen | Draws them at 60% opacity | Off |
+| Show position bar | Thin bar at the bottom marking the visible part of the strip | On |
+
+**Per-app widths** have no applet control yet. Add them to
+`~/.config/cosmic/com.system76.CosmicComp/v1/scrolling`, for example:
+
+```ron
+(
+    new_column_width: 0.5,
+    width_rules: [
+        (app_id: "org.kde.kate", width: 0.9),
+        (app_id: "brave-browser", width: 0.75),
+    ],
+)
+```
+
+Fields you leave out keep their defaults. App IDs match exactly, ignoring
+case; `cosmic-toplevel` or COSMIC's window-management settings show them.
 
 They're stored together in the `scrolling` key next to `tiling_engine`.
 
