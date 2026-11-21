@@ -72,13 +72,38 @@ workspace with **Super+Y** or the Window Layout applet. Then:
 | Super+Shift+Home / End | Move the whole column to the start or end |
 | Super+E | Give the columns on screen equal widths |
 | Super+Shift+E | Widen the focused column into free space |
+| Super+[ / Super+] | Squeeze the left or right neighbour on screen next to the focused column |
+| Super+Alt+1–9 | Focus column 1–9 |
+| Super+Alt+Shift+1–9 | Move the focused column to position 1–9 |
+| Super+Alt+W | Open the focused window's app at its current width from now on |
 | Super+` | Hide or show the workspace's floating windows (scratch layer) |
-| Super+Shift+O | Overview: zoom out to see the whole strip. Escape closes it |
+| Super+Shift+O | Overview: zoom out to see the whole strip. Click a window to go to it; Escape closes it |
 | Three-finger swipe sideways | Pan the strip |
 
 Orbit's own shortcuts only apply on tiled scrolling workspaces, and never
-override a shortcut you set in COSMIC Settings. The overview is view-only for
-now: clicks go to the windows' normal positions.
+override a shortcut you set in COSMIC Settings.
+
+### Changing Orbit's shortcuts
+
+In **COSMIC Settings → Keyboard → Keyboard shortcuts → Custom shortcuts**, add
+a shortcut whose command is `orbit` followed by an action. Orbit runs it
+itself; in the normal COSMIC session nothing happens. To turn off one of
+Orbit's default keys, give that key a different shortcut there.
+
+| Command | Action |
+|---|---|
+| `orbit center` | Centre the focused column |
+| `orbit scroll-left`, `orbit scroll-right` | Scroll the view one column |
+| `orbit focus-first`, `orbit focus-last` | Focus the first or last column |
+| `orbit focus-column N` | Focus column N (from 1) |
+| `orbit move-column-left`, `orbit move-column-right` | Move the whole column |
+| `orbit move-column-first`, `orbit move-column-last` | Move the column to the start or end |
+| `orbit move-to-column N` | Move the column to position N |
+| `orbit equalize`, `orbit expand` | Equal widths on screen; widen into free space |
+| `orbit squeeze-left`, `orbit squeeze-right` | Fit a neighbour on screen |
+| `orbit remember-width` | Keep the focused app's current width |
+| `orbit scratch` | Hide or show floating windows |
+| `orbit overview` | Toggle the overview |
 
 The applet switches between **Floating**, **Tiling** (COSMIC's classic layout)
 and **Scrolling**, for the current workspace and for new workspaces. The
@@ -86,7 +111,8 @@ engine choice is global and stored in
 `~/.config/cosmic/com.system76.CosmicComp/v1/tiling_engine`; normal COSMIC
 ignores it.
 
-While the engine is Scrolling, the applet also shows:
+While the engine is Scrolling, the applet also has a **Scrolling settings**
+section (click it to open):
 
 | Setting | What it does | Default |
 |---|---|---|
@@ -100,8 +126,10 @@ While the engine is Scrolling, the applet also shows:
 | Dim windows partly off screen | Draws them at 60% opacity | Off |
 | Show position bar | Thin bar at the bottom marking the visible part of the strip | On |
 
-**Per-app widths** have no applet control yet. Add them to
-`~/.config/cosmic/com.system76.CosmicComp/v1/scrolling`, for example:
+**Per-app widths:** press Super+Alt+W on a window to open that app at its
+current width from now on. The applet lists the saved widths under
+**Per-app widths**, with a Remove button for each. You can also edit
+`~/.config/cosmic/com.system76.CosmicComp/v1/scrolling` directly, for example:
 
 ```ron
 (

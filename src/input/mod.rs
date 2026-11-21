@@ -860,6 +860,44 @@ impl State {
                 self.common.idle_notifier_state.notify_activity(&seat);
                 notify_cursor_activity(self, &seat, PointerEventKind::Other);
 
+                // Orbit: in the strip overview a click focuses the window under
+                // it and closes the overview. Neither the press nor its release
+                // reaches the app.
+                {
+                    use crate::backend::render::scrolling_backdrop as orbit;
+                    let button = event.button_code();
+                    if event.state() == ButtonState::Released
+                        && orbit::take_swallowed_release(button)
+                    {
+                        return;
+                    }
+                    if orbit::strip_overview_open() && event.state() == ButtonState::Pressed {
+                        let target = self.common.shell.read().strip_overview_window_at(&seat);
+                        orbit::close_strip_overview();
+                        orbit::swallow_release_of(button);
+                        if let Some(mapped) = target {
+                            Shell::set_focus(
+                                self,
+                                Some(&KeyboardFocusTarget::from(mapped)),
+                                &seat,
+                                None,
+                                false,
+                            );
+                        }
+                        let outputs = self
+                            .common
+                            .shell
+                            .read()
+                            .outputs()
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        for output in &outputs {
+                            self.backend.schedule_render(output);
+                        }
+                        return;
+                    }
+                }
+
                 let current_focus = seat.get_keyboard().unwrap().current_focus();
                 let shortcuts_inhibited = current_focus.as_ref().is_some_and(|f| {
                     f.wl_surface()

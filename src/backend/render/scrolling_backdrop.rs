@@ -257,6 +257,34 @@ pub fn overview_transform(
     Some((px, py, k))
 }
 
+/// Orbit: undo `overview_transform` for a point on screen, giving where that
+/// point is in the unzoomed layout (output-local, logical).
+pub fn overview_point_to_layout(
+    point: (f64, f64),
+    zone: Rectangle<i32, Local>,
+    viewport_x: f64,
+    strip_width: f64,
+) -> Option<(f64, f64)> {
+    let (px, py, k) = overview_transform(zone, viewport_x, strip_width)?;
+    Some((px + (point.0 - px) / k, py + (point.1 - py) / k))
+}
+
+/// Button whose release should be swallowed because its press closed the
+/// overview. `u32::MAX` means none.
+static SWALLOWED_RELEASE: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// Remember that the release of `button` belongs to an overview click.
+pub fn swallow_release_of(button: u32) {
+    SWALLOWED_RELEASE.store(button, Ordering::Relaxed);
+}
+
+/// True once, for the release that matches an overview click.
+pub fn take_swallowed_release(button: u32) -> bool {
+    SWALLOWED_RELEASE
+        .compare_exchange(button, u32::MAX, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,5 +329,24 @@ mod tests {
         assert!((map(2_500.0) - (1_096.0 - OVERVIEW_MARGIN)).abs() < 1e-6);
         assert_eq!(py, 400.0);
         assert!(overview_transform(zone, 0.0, 900.0).is_none());
+    }
+
+    #[test]
+    fn overview_clicks_map_back_to_layout_positions() {
+        let zone = Rectangle::new((0, 0).into(), (1_096, 800).into());
+        let (px, py, k) = overview_transform(zone, 1_500.0, 4_000.0).unwrap();
+        for (x, y) in [(-1_500.0, 100.0), (0.0, 400.0), (2_400.0, 700.0)] {
+            let screen = (px * (1.0 - k) + k * x, py * (1.0 - k) + k * y);
+            let (bx, by) = overview_point_to_layout(screen, zone, 1_500.0, 4_000.0).unwrap();
+            assert!((bx - x).abs() < 1e-6 && (by - y).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn only_the_matching_release_is_swallowed() {
+        swallow_release_of(272);
+        assert!(!take_swallowed_release(273));
+        assert!(take_swallowed_release(272));
+        assert!(!take_swallowed_release(272));
     }
 }

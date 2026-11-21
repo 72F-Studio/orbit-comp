@@ -4490,6 +4490,35 @@ impl Shell {
             .flatten()
     }
 
+    /// Orbit: the window under the pointer while the strip overview is
+    /// shown, found by undoing the overview's zoom.
+    pub fn strip_overview_window_at(&self, seat: &Seat<State>) -> Option<CosmicMapped> {
+        let pointer = seat.get_pointer()?;
+        let pos = pointer.current_location().as_global();
+        let output = self
+            .outputs()
+            .find(|output| output.geometry().to_f64().contains(pos))?
+            .clone();
+        let workspace = self.active_space(&output)?;
+        let (viewport_x, _, strip_width) = workspace.tiling_layer.scrolling_strip_metrics()?;
+        let zone = layer_map_for_output(&output)
+            .non_exclusive_zone()
+            .as_local();
+        let local = pos - output.geometry().loc.to_f64();
+        let (x, y) = crate::backend::render::scrolling_backdrop::overview_point_to_layout(
+            (local.x, local.y),
+            zone,
+            viewport_x,
+            strip_width,
+        )?;
+        let point = Point::<f64, Local>::from((x, y));
+        workspace
+            .tiling_layer
+            .mapped()
+            .find(|(_, geometry)| geometry.to_f64().contains(point))
+            .map(|(mapped, _)| mapped.clone())
+    }
+
     /// Orbit: the focused scrolling window's app ID and column width.
     pub fn scrolling_focused_width(&self, seat: &Seat<State>) -> Option<(String, f64)> {
         let output = seat.focused_output()?;

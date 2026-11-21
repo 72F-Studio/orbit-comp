@@ -22,19 +22,22 @@ M medium, L large.
 - Scratch layer toggle for floating windows.
 - Strip position indicator.
 - Focus crosses to the next monitor at the strip's edge.
-- Strip overview (view-only).
+- Strip overview; click a window to go to it.
+- Focus and move columns by number (Super+Alt+1-9).
+- Squeeze a neighbour on screen.
+- Per-app widths from the focused window (Super+Alt+W), listed in the applet.
+- Every Orbit action can be rebound in COSMIC Settings as an `orbit ...`
+  custom shortcut.
+- Collapsible Scrolling section in the applet.
 - Tabbed columns, through COSMIC's existing window stacks (Super+S).
 
 ## Next
 
 | Feature | Notes | Effort |
 |---|---|---|
-| Clickable overview | Map pointer input through the overview transform, so a click focuses a window | M |
-| Applet editor for width rules | Add "open this app at its current width" to the applet | M |
-| Focus or move by number | Super+1-9 belong to workspaces; needs another modifier, such as Super+Alt+1-9 | S |
-| Squeeze a neighbour on screen | Karousel Meta+Ctrl+A/D | S |
+| Hover in the overview | Pointer motion still goes to the unzoomed positions; only clicks are mapped | S |
 | Per-workspace centering mode | PaperWM lets each workspace pick its own | M |
-| Popup height | The applet popup is long while Scrolling is on; consider a scrollable or collapsible section | S |
+| Orbit page in COSMIC Settings | Needs a fork of pop-os/cosmic-settings; the applet covers the same settings | L |
 
 ## Maintenance
 
