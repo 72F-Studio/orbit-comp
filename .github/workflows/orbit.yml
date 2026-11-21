@@ -1,0 +1,69 @@
+name: Orbit
+
+on:
+    push:
+        branches: [main]
+    pull_request:
+        branches: [main]
+    schedule:
+        # Mondays: check that main still rebases onto the newest COSMIC release.
+        - cron: "0 6 * * 1"
+    workflow_dispatch:
+
+env:
+    DEPS: libudev-dev libgbm-dev libxkbcommon-dev libegl1-mesa-dev libwayland-dev libinput-dev libdbus-1-dev libsystemd-dev libseat-dev libdisplay-info-dev libpixman-1-dev
+
+jobs:
+    check:
+        if: github.event_name != 'schedule'
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v6
+            - uses: dtolnay/rust-toolchain@stable
+              with:
+                  components: rustfmt, clippy
+            - uses: actions/cache@v5
+              with:
+                  path: |
+                      ~/.cargo/registry
+                      ~/.cargo/git
+                      target
+                  key: ${{ runner.os }}-orbit-${{ hashFiles('**/Cargo.lock') }}
+            - run: sudo apt-get update && sudo apt-get install -y $DEPS
+            - name: Format
+              run: cargo fmt --all -- --check
+            - name: Clippy
+              run: cargo clippy --all-features -- -D warnings
+            - name: Tests
+              run: cargo test --workspace
+            - name: Session script tests
+              run: python3 -m unittest discover -s session/tests -v
+
+    upstream-rebase:
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v6
+              with:
+                  fetch-depth: 0
+            - name: Try rebasing onto the newest COSMIC epoch tag
+              run: |
+                  git remote add upstream https://github.com/pop-os/cosmic-comp.git
+                  git fetch --quiet --tags upstream
+                  latest=$(git tag --list 'epoch-*' --sort=-v:refname | head -n 1)
+                  base=$(git describe --tags --match 'epoch-*' --abbrev=0 HEAD)
+                  echo "Orbit is based on $base; newest COSMIC release is $latest."
+                  if [ "$latest" = "$base" ]; then
+                      echo "Up to date."
+                      exit 0
+                  fi
+                  git config user.name "Orbit CI"
+                  git config user.email "ci@invalid"
+                  if git rebase --onto "$latest" "$base" HEAD; then
+                      echo "::notice::main rebases cleanly onto $latest."
+                  else
+                      git status --short | grep -E '^(UU|AA|DU|UD)' || true
+                      git rebase --abort
+                      echo "::error::main conflicts with $latest. Rebase it by hand."
+                      exit 1
+                  fi

@@ -58,9 +58,25 @@ workspace with **Super+Y** or the Window Layout applet. Then:
 | Three-finger swipe sideways     | Pan the strip of columns                     |
 
 The applet switches between **Floating**, **Tiling** (COSMIC's classic layout)
-and **Scrolling**. The engine choice is stored in
-`~/.config/cosmic/com.system76.CosmicComp/v1/tiling_engine`. Normal COSMIC
-ignores that setting, so your normal session is not affected.
+and **Scrolling**, for the current workspace and for new workspaces. The
+engine choice is global and stored in
+`~/.config/cosmic/com.system76.CosmicComp/v1/tiling_engine`; normal COSMIC
+ignores it.
+
+While the engine is Scrolling, the applet also shows:
+
+| Setting | What it does | Default |
+|---|---|---|
+| New window width | Column width for newly opened windows: 25%, 50%, 75%, 90% or a custom 25–100% | 50% |
+| Focus the window you scroll to | A touchpad pan focuses the window it scrolls into, once enough of it is on screen | Off |
+| Once this much of it is on screen | How much of that window must be visible first | 60% |
+| Blur the desktop behind windows | Blurs the wallpaper and desktop icons behind a scrolling workspace | On |
+
+They're stored together in the `scrolling` key next to `tiling_engine`.
+
+**Maximize** on a scrolling workspace widens the window's column to the full
+screen, and maximizing again restores its width. Apps that reopen maximized,
+such as browsers, open at the new-window width instead.
 
 Orbit uses your normal COSMIC settings (wallpaper, panel, keyboard and so on),
 so changes you make in one session appear in the other.
