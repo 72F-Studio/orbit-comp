@@ -21,7 +21,15 @@ session stays installed and unchanged, so you can switch back at any time.
 
 ## Install
 
-From the `orbit-comp` checkout:
+Clone both repos side by side:
+
+```bash
+git clone https://github.com/72F-Studio/orbit-comp.git
+git clone https://github.com/72F-Studio/orbit-applets.git
+cd orbit-comp
+```
+
+Then, from the `orbit-comp` checkout:
 
 ```bash
 session/install.sh
