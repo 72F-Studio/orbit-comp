@@ -2069,6 +2069,14 @@ impl TilingLayout {
         self.push_scrolling_animation(tree, blocker);
     }
 
+    /// Orbit: strip position for the indicator; see `ScrollingLayout::strip_metrics`.
+    pub fn scrolling_strip_metrics(&self) -> Option<(f64, i32, f64)> {
+        if self.tiling_engine != TilingEngine::Scrolling {
+            return None;
+        }
+        self.scrolling.strip_metrics()
+    }
+
     /// Orbit: run a strip action. Returns `None` if the engine isn't
     /// Scrolling, otherwise the window to focus next, if the action picks one.
     pub fn scrolling_strip_action(
@@ -6412,6 +6420,17 @@ fn render_new_tree_popups<R>(
     );
 }
 
+/// Orbit: opacity factor for a scrolling window at `geo`. Windows that reach
+/// past the left or right edge of `zone` get the off-screen opacity.
+fn offscreen_alpha(geo: &Rectangle<i32, Local>, zone: &Rectangle<i32, Local>) -> f32 {
+    let off_screen = geo.loc.x < zone.loc.x || geo.loc.x + geo.size.w > zone.loc.x + zone.size.w;
+    if off_screen {
+        crate::backend::render::scrolling_backdrop::offscreen_opacity()
+    } else {
+        1.0
+    }
+}
+
 fn render_new_tree_windows<R>(
     target_tree: &Tree<Data>,
     reference_tree: Option<&Tree<Data>>,
@@ -6744,6 +6763,12 @@ fn render_new_tree_windows<R>(
             if let Data::Mapped { mapped, .. } = data {
                 let committed_geometry = mapped.geometry();
                 let elem_geometry = committed_geometry.to_physical_precise_round(output_scale);
+                // Orbit: dim scrolling windows that are partly off screen.
+                let alpha = if is_scrolling && !is_overview {
+                    alpha * offscreen_alpha(&geo, &non_exclusive_zone)
+                } else {
+                    alpha
+                };
 
                 let scale = geo.size.to_f64() / original_geo.size.to_f64();
                 let constrain_animated_width = tiled_window_has_animated_width(

@@ -1053,6 +1053,29 @@ where
                 );
             }
             Stage::Workspace { workspace, offset } => {
+                // Orbit: strip position indicator, above the windows.
+                if workspace.handle == current.0 {
+                    let hint = crate::theme::active_window_hint(theme.cosmic());
+                    for indicator in scrolling_backdrop::position_indicator_elements(
+                        renderer,
+                        output,
+                        workspace,
+                        [hint.red, hint.green, hint.blue],
+                    ) {
+                        let elem = WorkspaceRenderElement::from(CosmicMappedRenderElement::from(
+                            indicator,
+                        ));
+                        if let Some(elem) = crop_to_output(elem) {
+                            elements.push(CosmicElement::Workspace(
+                                RelocateRenderElement::from_element(
+                                    elem,
+                                    offset.to_physical_precise_round(scale),
+                                    Relocate::Relative,
+                                ),
+                            ));
+                        }
+                    }
+                }
                 workspace.render(
                     renderer,
                     last_active_seat,

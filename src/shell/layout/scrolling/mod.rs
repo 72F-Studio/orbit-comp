@@ -438,6 +438,18 @@ impl ScrollingLayout {
         self.model.scroll_focus_candidate(threshold)
     }
 
+    /// Orbit: `(viewport_x, viewport_width, strip_width)` for the position
+    /// indicator, or `None` when the whole strip fits on screen.
+    pub(super) fn strip_metrics(&self) -> Option<(f64, i32, f64)> {
+        let strip = self.model.strip_width();
+        let viewport = self.model.viewport_width;
+        (viewport > 0 && strip > viewport as f64 + 1.0).then_some((
+            self.model.viewport_x,
+            viewport,
+            strip,
+        ))
+    }
+
     /// Orbit: scroll the view one column without moving focus.
     pub(super) fn scroll_by_column(&mut self, delta: isize) -> bool {
         self.model.scroll_by_column(delta)
@@ -1093,6 +1105,7 @@ where
 
     /// Insert a confirmed new toplevel without making tree preorder
     /// authoritative for ordinary reconciliation.
+    #[cfg(test)]
     fn insert_new_toplevel(&mut self, tile: T, focused: Option<&T>) {
         let fraction = self.settings.new_column_fraction;
         self.insert_new_toplevel_with_width(tile, focused, fraction);
