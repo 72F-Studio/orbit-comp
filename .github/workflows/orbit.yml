@@ -31,11 +31,11 @@ jobs:
                   key: ${{ runner.os }}-orbit-${{ hashFiles('**/Cargo.lock') }}
             - run: sudo apt-get update && sudo apt-get install -y $DEPS
             - name: Format
-              run: cargo fmt --all -- --check
+              run: cargo +stable fmt --all -- --check
             - name: Clippy
-              run: cargo clippy --all-features -- -D warnings
+              run: cargo +stable clippy --all-features -- -D warnings
             - name: Tests
-              run: cargo test --workspace
+              run: cargo +stable test --workspace
             - name: Session script tests
               run: python3 -m unittest discover -s session/tests -v
 
