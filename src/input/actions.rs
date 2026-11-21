@@ -79,6 +79,12 @@ impl State {
                 )
             }
             Action::Private(PrivateAction::Escape) => {
+                if crate::backend::render::scrolling_backdrop::strip_overview_open() {
+                    crate::backend::render::scrolling_backdrop::close_strip_overview();
+                    for output in self.common.shell.read().outputs() {
+                        self.backend.schedule_render(output);
+                    }
+                }
                 {
                     let mut shell = self.common.shell.write();
                     shell.set_overview_mode(None, self.common.event_loop_handle.clone());

@@ -232,6 +232,31 @@ pub fn position_indicator_elements(
     ]
 }
 
+const OVERVIEW_MARGIN: f64 = 48.0;
+
+/// Orbit: how to draw the strip overview. Returns the point to scale around
+/// (output-local, logical) and the scale, so that the strip's start lands
+/// `OVERVIEW_MARGIN` from the usable area's left edge, its end the same
+/// distance from the right, and windows stay vertically centred. `None` when
+/// the strip already fits.
+pub fn overview_transform(
+    zone: Rectangle<i32, Local>,
+    viewport_x: f64,
+    strip_width: f64,
+) -> Option<(f64, f64, f64)> {
+    let available = zone.size.w as f64 - 2.0 * OVERVIEW_MARGIN;
+    if available <= 0.0 || strip_width <= available {
+        return None;
+    }
+    let k = available / strip_width;
+    // Strip x `X` is drawn at local `zone.x + X - viewport_x`; scaling by `k`
+    // around `p` maps it to `p (1 - k) + k x`, which must equal
+    // `zone.x + margin + k X`.
+    let px = zone.loc.x as f64 + (OVERVIEW_MARGIN + k * viewport_x) / (1.0 - k);
+    let py = zone.loc.y as f64 + zone.size.h as f64 / 2.0;
+    Some((px, py, k))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,5 +288,18 @@ mod tests {
         assert!(thumb.loc.x + thumb.size.w <= track.loc.x + track.size.w);
         let (_, thumb) = indicator_geometry(zone(), -300.0, 1_000, 2_000.0).unwrap();
         assert_eq!(thumb.loc.x, INDICATOR_MARGIN);
+    }
+
+    #[test]
+    fn overview_maps_the_strip_into_the_margins() {
+        let zone = Rectangle::new((0, 0).into(), (1_096, 800).into());
+        let (px, py, k) = overview_transform(zone, 1_500.0, 4_000.0).unwrap();
+        assert!((k - 0.25).abs() < 1e-9);
+        let map = |x: f64| px * (1.0 - k) + k * x;
+        // Strip start (local x = -1500) and end (local x = 2500).
+        assert!((map(-1_500.0) - OVERVIEW_MARGIN).abs() < 1e-6);
+        assert!((map(2_500.0) - (1_096.0 - OVERVIEW_MARGIN)).abs() < 1e-6);
+        assert_eq!(py, 400.0);
+        assert!(overview_transform(zone, 0.0, 900.0).is_none());
     }
 }

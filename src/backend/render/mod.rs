@@ -1076,6 +1076,31 @@ where
                         }
                     }
                 }
+                // Orbit: zoomed-out strip overview for the current workspace.
+                let strip_overview = (workspace.handle == current.0
+                    && scrolling_backdrop::strip_overview_open())
+                .then(|| workspace.tiling_layer.scrolling_strip_metrics())
+                .flatten()
+                .and_then(|(viewport_x, _, strip_width)| {
+                    let zone = smithay::desktop::layer_map_for_output(output)
+                        .non_exclusive_zone()
+                        .as_local();
+                    scrolling_backdrop::overview_transform(zone, viewport_x, strip_width)
+                });
+                let place = |elem: WorkspaceRenderElement<R>| match strip_overview {
+                    Some((px, py, k)) => CropRenderElement::from_element(
+                        RescaleRenderElement::from_element(
+                            elem,
+                            Point::<f64, Logical>::from((px, py))
+                                .to_physical(scale)
+                                .to_i32_round(),
+                            k,
+                        ),
+                        scale,
+                        Rectangle::from_size(output_size),
+                    ),
+                    None => crop_to_output(elem),
+                };
                 workspace.render(
                     renderer,
                     last_active_seat,
@@ -1086,7 +1111,7 @@ where
                     theme.cosmic(),
                     scanout_node,
                     &mut |elem| {
-                        if let Some(elem) = crop_to_output(elem) {
+                        if let Some(elem) = place(elem) {
                             elements.push(CosmicElement::Workspace(
                                 RelocateRenderElement::from_element(
                                     elem,

@@ -2632,8 +2632,8 @@ impl State {
 
         std::mem::drop(shell);
 
-        // cancel grabs
-        if is_grabbed
+        // cancel grabs (Orbit: and close the strip overview)
+        if (is_grabbed || crate::backend::render::scrolling_backdrop::strip_overview_open())
             && handle.modified_sym() == Keysym::Escape
             && key_state == KeyState::Pressed
             && !modifiers.alt
