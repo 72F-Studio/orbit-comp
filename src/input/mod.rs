@@ -1349,16 +1349,37 @@ impl State {
                                         } else {
                                             event.delta().x
                                         };
-                                        match self.common.shell.write().pan_scrolling_viewport(
-                                            &target.output,
-                                            target.workspace,
-                                            delta_x,
-                                        ) {
+                                        let panned =
+                                            self.common.shell.write().pan_scrolling_viewport(
+                                                &target.output,
+                                                target.workspace,
+                                                delta_x,
+                                            );
+                                        match panned {
                                             Some(true) => {
                                                 self.backend.schedule_render(&target.output)
                                             }
                                             Some(false) => {}
                                             None => gesture_state.action = None,
+                                        }
+                                        // Orbit: optionally focus the window panned into.
+                                        let scrolling = self.common.config.cosmic_conf.scrolling;
+                                        if panned == Some(true) && scrolling.focus_follows_scroll {
+                                            let focus =
+                                                self.common.shell.write().scroll_focus_target(
+                                                    &target.output,
+                                                    target.workspace,
+                                                    scrolling.clamped_focus_scroll_threshold(),
+                                                );
+                                            if let Some(mapped) = focus {
+                                                Shell::set_focus(
+                                                    self,
+                                                    Some(&KeyboardFocusTarget::from(mapped)),
+                                                    &seat,
+                                                    None,
+                                                    false,
+                                                );
+                                            }
                                         }
                                     }
                                 } else {

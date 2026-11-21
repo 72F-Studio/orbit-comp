@@ -90,6 +90,7 @@ use smithay_egui::EguiState;
 pub mod animations;
 pub mod cursor;
 pub mod element;
+pub mod scrolling_backdrop;
 pub mod shadow;
 pub mod wayland;
 use self::element::{AsGlowRenderer, CosmicElement};
@@ -1073,6 +1074,22 @@ where
                         }
                     },
                 );
+                // Orbit: blur the lower layers behind a scrolling workspace.
+                // Pushed after the windows, so it sits below them and above the
+                // bottom and background layers drawn next.
+                if workspace.handle == current.0
+                    && let Some(blur) =
+                        scrolling_backdrop::backdrop_blur_element(renderer, output, workspace)
+                    && let Some(elem) = crop_to_output(blur.into())
+                {
+                    elements.push(CosmicElement::Workspace(
+                        RelocateRenderElement::from_element(
+                            elem,
+                            offset.to_physical_precise_round(scale),
+                            Relocate::Relative,
+                        ),
+                    ));
+                }
             }
         };
 

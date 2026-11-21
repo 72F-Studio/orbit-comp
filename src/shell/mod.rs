@@ -3149,6 +3149,13 @@ impl Shell {
         let workspace_handle = workspace.handle;
         let is_dialog = layout::is_dialog(&window);
         let floating_exception = layout::has_floating_exception(&self.tiling_exceptions, &window);
+        // Orbit: apps that reopen maximized (browsers, editors) would otherwise
+        // start full width on a scrolling workspace; open them tiled at the
+        // new-window width instead.
+        let opens_scrolling = !is_dialog
+            && !floating_exception
+            && workspace.tiling_enabled
+            && workspace.tiling_layer.mode() == TilingEngine::Scrolling;
 
         if should_be_fullscreen {
             workspace.map_fullscreen(&window, &seat, None, None);
@@ -3216,7 +3223,7 @@ impl Shell {
             self.toggle_sticky(&seat, &mapped);
         }
 
-        if should_be_maximized {
+        if should_be_maximized && !opens_scrolling {
             self.maximize_request(&mapped, &seat, false, loop_handle, ModalBehavior::Ignore);
         }
 
@@ -4486,6 +4493,21 @@ impl Shell {
         Some(workspace.tiling_layer.pan_scrolling_viewport(delta_x))
     }
 
+    /// Orbit: the window a pan has scrolled into on this workspace, if focus
+    /// should follow it. See `TilingLayout::scroll_focus_target`.
+    pub fn scroll_focus_target(
+        &mut self,
+        output: &Output,
+        workspace_handle: WorkspaceHandle,
+        threshold: f64,
+    ) -> Option<CosmicMapped> {
+        let workspace = self.active_space_mut(output)?;
+        if workspace.handle != workspace_handle {
+            return None;
+        }
+        workspace.tiling_layer.scroll_focus_target(threshold)
+    }
+
     #[must_use]
     pub fn move_current_element(&mut self, direction: Direction, seat: &Seat<State>) -> MoveResult {
         let Some(output) = seat.focused_output() else {
@@ -4772,6 +4794,16 @@ impl Shell {
             return;
         }
         self.unminimize_request(&mapped.active_window(), seat, loop_handle);
+
+        // Orbit: on a scrolling workspace, maximizing a tiled window widens its
+        // column instead of lifting it out of the strip as a floating overlay.
+        if let Some(workspace) = self.space_for_mut(mapped)
+            && workspace.is_tiled(&mapped.active_window())
+            && workspace.tiling_layer.mode() == TilingEngine::Scrolling
+        {
+            workspace.tiling_layer.toggle_scrolling_full_width(mapped);
+            return;
+        }
 
         let (original_layer, floating_layer, original_geometry) = if let Some(set) = self
             .workspaces

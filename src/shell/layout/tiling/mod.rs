@@ -425,6 +425,8 @@ pub struct TilingLayout {
     queue: TreeQueue,
     tiling_engine: TilingEngine,
     scrolling: ScrollingLayout,
+    /// Orbit: a node focused by panning, whose next `ensure_visible` is skipped.
+    scroll_focus_hold: Option<NodeId>,
     scrolling_live_resize: Option<ScrollingLiveResize>,
     backdrop_id: Id,
     swapping_stack_surface_id: Id,
@@ -661,6 +663,7 @@ impl TilingLayout {
             output: output.clone(),
             tiling_engine,
             scrolling: ScrollingLayout::default(),
+            scroll_focus_hold: None,
             scrolling_live_resize: None,
             backdrop_id: Id::new(),
             swapping_stack_surface_id: Id::new(),
@@ -2041,6 +2044,10 @@ impl TilingLayout {
         let Some(node_id) = elem.tiling_node_id.lock().unwrap().clone() else {
             return;
         };
+        // Orbit: focus that a pan moved here must not scroll the strip.
+        if self.scroll_focus_hold.take().as_ref() == Some(&node_id) {
+            return;
+        }
         if !self.scrolling.ensure_visible(&node_id) {
             return;
         }
@@ -2051,6 +2058,50 @@ impl TilingLayout {
             self.scrolling
                 .update_positions_ensuring(&self.output, &mut tree, gaps, Some(&node_id));
         self.push_scrolling_animation(tree, blocker);
+    }
+
+    /// Orbit: maximize for Scrolling. Toggles `elem`'s column between full
+    /// width and its previous width. Returns false if `elem` isn't tiled here
+    /// or the engine isn't Scrolling.
+    pub fn toggle_scrolling_full_width(&mut self, elem: &CosmicMapped) -> bool {
+        if self.tiling_engine != TilingEngine::Scrolling {
+            return false;
+        }
+        let Some(node_id) = elem.tiling_node_id.lock().unwrap().clone() else {
+            return false;
+        };
+        let mut tree = self.queue.trees.back().unwrap().0.copy_clone();
+        if !self.scrolling.toggle_full_width(&node_id) {
+            return false;
+        }
+        let gaps = self.gaps();
+        let blocker =
+            self.scrolling
+                .update_positions_ensuring(&self.output, &mut tree, gaps, Some(&node_id));
+        self.push_scrolling_animation(tree, blocker);
+        true
+    }
+
+    /// Orbit: after a pan, the window that focus should follow to, if any.
+    ///
+    /// The scrolling model is marked focused on it right away, and the next
+    /// `ensure_visible` for it (from the shell's focus change) is skipped so
+    /// the strip stays where the pan left it.
+    pub fn scroll_focus_target(&mut self, threshold: f64) -> Option<CosmicMapped> {
+        if self.tiling_engine != TilingEngine::Scrolling {
+            return None;
+        }
+        let node_id = self.scrolling.scroll_focus_candidate(threshold)?;
+        let mapped = match self.tree().get(&node_id).ok()?.data() {
+            Data::Mapped { mapped, .. } => mapped.clone(),
+            _ => return None,
+        };
+        if mapped.is_maximized(true) || mapped.is_fullscreen(true) {
+            return None;
+        }
+        self.scrolling.focus_without_scroll(&node_id);
+        self.scroll_focus_hold = Some(node_id);
+        Some(mapped)
     }
 
     /// Pan Scrolling geometry immediately. This changes only the virtual

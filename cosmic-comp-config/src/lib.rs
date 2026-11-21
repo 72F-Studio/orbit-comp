@@ -96,6 +96,59 @@ impl TilingEngine {
     }
 }
 
+/// Orbit: settings for the Scrolling tiling engine.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ScrollingConfig {
+    /// Width of a newly opened window's column, as a fraction of the output
+    /// width. Clamped to `MIN_COLUMN_WIDTH..=1.0` when used.
+    pub new_column_width: f64,
+    /// Focus the window that a touchpad pan scrolls into, once enough of it is
+    /// on screen. Off keeps focus where it was while panning.
+    pub focus_follows_scroll: bool,
+    /// How much of a window's width must be on screen before a pan focuses
+    /// it, as a fraction. Clamped to `0.1..=1.0` when used.
+    pub focus_scroll_threshold: f64,
+    /// Blur the wallpaper and desktop icons behind scrolling workspaces.
+    pub backdrop_blur: bool,
+}
+
+impl ScrollingConfig {
+    /// Narrowest column a new window may open with.
+    pub const MIN_COLUMN_WIDTH: f64 = 0.25;
+    /// Width presets offered for new windows.
+    pub const NEW_COLUMN_WIDTH_PRESETS: [f64; 4] = [0.25, 0.5, 0.75, 0.9];
+
+    /// `new_column_width`, made safe to use even if the stored value is bad.
+    pub fn clamped_new_column_width(&self) -> f64 {
+        if self.new_column_width.is_finite() {
+            self.new_column_width.clamp(Self::MIN_COLUMN_WIDTH, 1.0)
+        } else {
+            Self::default().new_column_width
+        }
+    }
+
+    /// `focus_scroll_threshold`, made safe to use even if the stored value is bad.
+    pub fn clamped_focus_scroll_threshold(&self) -> f64 {
+        if self.focus_scroll_threshold.is_finite() {
+            self.focus_scroll_threshold.clamp(0.1, 1.0)
+        } else {
+            Self::default().focus_scroll_threshold
+        }
+    }
+}
+
+impl Default for ScrollingConfig {
+    fn default() -> Self {
+        Self {
+            new_column_width: 0.5,
+            focus_follows_scroll: false,
+            focus_scroll_threshold: 0.6,
+            backdrop_blur: true,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, CosmicConfigEntry)]
 #[version = 1]
 pub struct CosmicCompConfig {
@@ -111,6 +164,8 @@ pub struct CosmicCompConfig {
     pub autotile: bool,
     /// Selects the tiling layout engine independently of whether tiling is enabled
     pub tiling_engine: TilingEngine,
+    /// Orbit: Scrolling engine settings
+    pub scrolling: ScrollingConfig,
     /// Determines the behavior of the autotile variable
     /// If set to Global, autotile applies to all windows in all workspaces
     /// If set to PerWorkspace, autotile only applies to new windows, and new workspaces
@@ -164,6 +219,7 @@ impl Default for CosmicCompConfig {
             keyboard_config: Default::default(),
             autotile: Default::default(),
             tiling_engine: Default::default(),
+            scrolling: Default::default(),
             autotile_behavior: Default::default(),
             active_hint: true,
             focus_follows_cursor: false,
@@ -477,6 +533,32 @@ mod tests {
     use cosmic_config::ConfigSet;
     use std::time::{SystemTime, UNIX_EPOCH};
     use workspace::WorkspaceLayout;
+
+    #[test]
+    fn scrolling_config_clamps_bad_values() {
+        let mut config = ScrollingConfig {
+            new_column_width: 0.1,
+            focus_scroll_threshold: 3.0,
+            ..Default::default()
+        };
+        assert_eq!(
+            config.clamped_new_column_width(),
+            ScrollingConfig::MIN_COLUMN_WIDTH
+        );
+        assert_eq!(config.clamped_focus_scroll_threshold(), 1.0);
+        config.new_column_width = f64::NAN;
+        config.focus_scroll_threshold = f64::INFINITY;
+        assert_eq!(config.clamped_new_column_width(), 0.5);
+        assert_eq!(config.clamped_focus_scroll_threshold(), 0.6);
+    }
+
+    #[test]
+    fn scrolling_config_reads_partial_ron() {
+        let config: ScrollingConfig = ron::from_str("(new_column_width: 0.9)").unwrap();
+        assert_eq!(config.new_column_width, 0.9);
+        assert!(config.backdrop_blur);
+        assert!(!config.focus_follows_scroll);
+    }
 
     #[test]
     fn tiling_engine_defaults_to_classic() {

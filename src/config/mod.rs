@@ -55,7 +55,7 @@ use cosmic::config::CosmicTk;
 pub use cosmic_comp_config::EdidProduct;
 use cosmic_comp_config::{
     ActivationPolicy, AppearanceConfig, CosmicCompConfig, CursorHideConfig, DecorationPreference,
-    KeyboardConfig, TileBehavior, TilingEngine, XkbConfig, XwaylandDescaling,
+    KeyboardConfig, ScrollingConfig, TileBehavior, TilingEngine, XkbConfig, XwaylandDescaling,
     XwaylandEavesdropping, ZoomConfig,
     input::{DeviceState as InputDeviceState, InputConfig, TouchpadOverride},
     output::comp::{
@@ -80,6 +80,13 @@ pub struct Config {
     pub tiling_exceptions: Vec<ApplicationException>,
     /// System actions from `com.system76.CosmicSettings.Shortcuts`
     pub system_actions: BTreeMap<shortcuts::action::System, String>,
+}
+
+/// Orbit: push the Scrolling settings that rendering and layout read
+/// directly. Focus-follows-scroll is read from the config where it's used.
+fn apply_scrolling_config(scrolling: &ScrollingConfig) {
+    crate::shell::layout::scrolling::set_new_column_fraction(scrolling.clamped_new_column_width());
+    crate::backend::render::scrolling_backdrop::set_backdrop_blur_enabled(scrolling.backdrop_blur);
 }
 
 fn initial_tiling_engine(
@@ -213,6 +220,7 @@ impl Config {
             cosmic_comp_config.tiling_engine,
             development_override.as_deref(),
         );
+        apply_scrolling_config(&cosmic_comp_config.scrolling);
 
         // `cursor_hide_timeout` was replaced by the grouped `cursor_hide` key.
         // Seed the new key once so configs hand-edited before the rename keep
@@ -996,6 +1004,23 @@ fn config_changed(config: cosmic_config::Config, keys: Vec<String>, state: &mut 
                         shell.workspaces.set_tiling_engine(new);
                         shell.outputs().cloned().collect::<Vec<_>>()
                     };
+                    for output in &outputs {
+                        state.backend.schedule_render(output);
+                    }
+                }
+            }
+            "scrolling" => {
+                let new = get_config::<ScrollingConfig>(&config, "scrolling");
+                if new != state.common.config.cosmic_conf.scrolling {
+                    state.common.config.cosmic_conf.scrolling = new;
+                    apply_scrolling_config(&new);
+                    let outputs = state
+                        .common
+                        .shell
+                        .read()
+                        .outputs()
+                        .cloned()
+                        .collect::<Vec<_>>();
                     for output in &outputs {
                         state.backend.schedule_render(output);
                     }

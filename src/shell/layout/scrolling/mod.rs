@@ -7,6 +7,7 @@
 //! screen coordinates by subtracting `viewport_x`.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use cosmic_settings_config::shortcuts::action::{Direction, FocusDirection, ResizeDirection};
 use id_tree::{NodeId, Tree};
@@ -23,7 +24,27 @@ use super::tiling::{Data, PlaceholderType, TilingBlocker};
 
 const DEFAULT_COLUMN_FRACTION: f64 = 0.66;
 const COLUMN_WIDTH_PRESETS: [f64; 4] = [0.33, 0.5, 0.66, 1.0];
-const MIN_COLUMN_FRACTION: f64 = 0.33;
+const MIN_COLUMN_FRACTION: f64 = cosmic_comp_config::ScrollingConfig::MIN_COLUMN_WIDTH;
+
+/// Width given to the column of a newly opened window, stored as `f64` bits.
+/// Set from the `scrolling.new_column_width` setting; tests keep the default.
+static NEW_COLUMN_FRACTION: AtomicU64 = AtomicU64::new(DEFAULT_COLUMN_FRACTION.to_bits());
+
+/// Apply the user's new-window width. Existing columns keep their widths.
+pub fn set_new_column_fraction(fraction: f64) {
+    let fraction = if fraction.is_finite() {
+        fraction.clamp(MIN_COLUMN_FRACTION, MAX_COLUMN_FRACTION)
+    } else {
+        DEFAULT_COLUMN_FRACTION
+    };
+    NEW_COLUMN_FRACTION.store(fraction.to_bits(), AtomicOrdering::Relaxed);
+}
+
+fn new_column_width() -> ColumnWidth {
+    ColumnWidth::new(f64::from_bits(
+        NEW_COLUMN_FRACTION.load(AtomicOrdering::Relaxed),
+    ))
+}
 const MAX_COLUMN_FRACTION: f64 = 1.0;
 const MIN_TILE_HEIGHT: i32 = 240;
 
@@ -347,6 +368,21 @@ impl ScrollingLayout {
     /// Directly pan the horizontal strip without changing focus or model order.
     pub(super) fn pan_viewport(&mut self, delta_x: f64) -> bool {
         self.model.pan_viewport(delta_x)
+    }
+
+    /// Orbit: the tile a pan has scrolled into, if focus should follow it.
+    pub(super) fn scroll_focus_candidate(&self, threshold: f64) -> Option<NodeId> {
+        self.model.scroll_focus_candidate(threshold)
+    }
+
+    /// Orbit: maximize for Scrolling; see `ColumnModel::toggle_full_width`.
+    pub(super) fn toggle_full_width(&mut self, tile: &NodeId) -> bool {
+        self.model.toggle_full_width(tile)
+    }
+
+    /// Orbit: focus `tile` while leaving the viewport where the pan put it.
+    pub(super) fn focus_without_scroll(&mut self, tile: &NodeId) -> bool {
+        self.model.focus_without_scroll(tile)
     }
 
     /// Recover the virtual viewport represented by an interrupted visual tree.
@@ -807,6 +843,15 @@ impl<T> Column<T> {
             width: ColumnWidth::default(),
         }
     }
+
+    /// A column for a window that has just appeared, at the user's
+    /// new-window width.
+    fn new_window(tile: T) -> Self {
+        Self {
+            tiles: vec![tile],
+            width: new_column_width(),
+        }
+    }
 }
 
 /// Persistent scrolling-strip state.
@@ -829,6 +874,9 @@ struct ColumnModel<T> {
     viewport_width: i32,
     gap: i32,
     column_height: i32,
+    /// Orbit: widths to restore when a full-width (maximized) column is
+    /// toggled back, keyed by the tile that asked for it.
+    full_width_restore: Vec<(T, ColumnWidth)>,
 }
 
 impl<T> Default for ColumnModel<T> {
@@ -843,6 +891,7 @@ impl<T> Default for ColumnModel<T> {
             viewport_width: 0,
             gap: 0,
             column_height: 0,
+            full_width_restore: Vec::new(),
         }
     }
 }
@@ -904,9 +953,12 @@ where
             if !retained.contains(&tile) {
                 retained.push(tile.clone());
                 self.tile_weights.push((tile.clone(), 1.0));
-                self.columns.push(Column::single(tile));
+                self.columns.push(Column::new_window(tile));
             }
         }
+
+        self.full_width_restore
+            .retain(|(tile, _)| retained.contains(tile));
 
         if self.columns.is_empty() {
             self.focused = None;
@@ -929,7 +981,8 @@ where
             .and_then(|focused| self.tile_position(focused))
             .map(|(column, _)| column + 1)
             .unwrap_or(self.columns.len());
-        self.columns.insert(insertion, Column::single(tile.clone()));
+        self.columns
+            .insert(insertion, Column::new_window(tile.clone()));
         self.set_tile_weight(tile, 1.0);
         self.clamp_viewport();
     }
@@ -1540,6 +1593,92 @@ where
         self.viewport_x += delta_x;
         self.clamp_viewport();
         (self.viewport_x - old_viewport).abs() > f64::EPSILON
+    }
+
+    /// Orbit: the tile a pan has scrolled into, if focus should move to it.
+    ///
+    /// A column qualifies once at least `threshold` of its width is inside the
+    /// viewport. Among qualifying columns the one covering the most of the
+    /// viewport wins, and it must cover more than the focused column does, so
+    /// focus never moves to a sliver at the edge. Returns `None` when the
+    /// focused column is still the best one.
+    fn scroll_focus_candidate(&self, threshold: f64) -> Option<T> {
+        if self.viewport_width <= 0 || self.columns.is_empty() {
+            return None;
+        }
+        let threshold = if threshold.is_finite() {
+            threshold.clamp(0.1, 1.0)
+        } else {
+            0.6
+        };
+        let left = self.viewport_x;
+        let right = left + self.viewport_width as f64;
+        let visible = |index: usize| {
+            let start = self.layout_x(index);
+            let end = start + self.column_width(index) as f64;
+            (end.min(right) - start.max(left)).max(0.0)
+        };
+        let focused_column = self
+            .focused
+            .as_ref()
+            .and_then(|tile| self.tile_position(tile))
+            .map(|(column, _)| column);
+
+        let (best, best_visible) = (0..self.columns.len())
+            .filter(|&index| visible(index) >= threshold * self.column_width(index) as f64)
+            .map(|index| (index, visible(index)))
+            .max_by(|a, b| a.1.total_cmp(&b.1))?;
+        if Some(best) == focused_column {
+            return None;
+        }
+        if let Some(focused) = focused_column
+            && visible(focused) >= best_visible
+        {
+            return None;
+        }
+
+        // A column always has at least one tile; focus its top one.
+        Some(self.columns[best].tiles[0].clone())
+    }
+
+    /// Orbit: maximize for Scrolling. Widen `tile`'s column to the full
+    /// output width, or, if it was widened this way, put the old width back.
+    /// Focuses the tile and lets the viewport follow it again.
+    fn toggle_full_width(&mut self, tile: &T) -> bool {
+        let Some((column, _)) = self.tile_position(tile) else {
+            return false;
+        };
+        let is_full = self.columns[column].width.fraction >= MAX_COLUMN_FRACTION - f64::EPSILON;
+        let restore = self
+            .full_width_restore
+            .iter()
+            .position(|(known, _)| known == tile);
+        match (is_full, restore) {
+            (true, Some(index)) => {
+                let (_, width) = self.full_width_restore.remove(index);
+                self.columns[column].width = width;
+            }
+            (true, None) => return false,
+            (false, _) => {
+                self.full_width_restore.retain(|(known, _)| known != tile);
+                self.full_width_restore
+                    .push((tile.clone(), self.columns[column].width));
+                self.columns[column].width = ColumnWidth::new(MAX_COLUMN_FRACTION);
+            }
+        }
+        self.focused = Some(tile.clone());
+        self.user_positioned_viewport = false;
+        true
+    }
+
+    /// Mark `tile` focused without moving the viewport, so a pan in progress
+    /// keeps control of where the strip is.
+    fn focus_without_scroll(&mut self, tile: &T) -> bool {
+        if self.tile_position(tile).is_none() {
+            return false;
+        }
+        self.focused = Some(tile.clone());
+        true
     }
 
     fn column_width(&self, index: usize) -> i32 {
@@ -2553,7 +2692,8 @@ mod tests {
 
         assert_eq!(
             model.resize_column_by_pixels(&1, -10_000, ColumnResizeAnchor::Left),
-            Some((true, -170))
+            // 0.5 down to the 0.25 floor on a 1000px viewport.
+            Some((true, -250))
         );
         assert_eq!(model.columns[0].width.fraction, MIN_COLUMN_FRACTION);
         assert_eq!(
@@ -2562,7 +2702,8 @@ mod tests {
         );
         assert_eq!(
             model.resize_column_by_pixels(&1, 10_000, ColumnResizeAnchor::Left),
-            Some((true, 670))
+            // From the 0.25 floor up to full width.
+            Some((true, 750))
         );
         assert_eq!(model.columns[0].width.fraction, MAX_COLUMN_FRACTION);
         assert_eq!(
@@ -3266,5 +3407,111 @@ mod tests {
             usable.size.h - viewport.size.h - (viewport.loc.y - usable.loc.y),
             12
         );
+    }
+
+    // --- Orbit: focus follows scroll ---------------------------------------
+
+    fn three_half_width_columns() -> ColumnModel<i32> {
+        let mut model = ColumnModel {
+            columns: vec![
+                Column {
+                    tiles: vec![1],
+                    width: ColumnWidth::new(0.5),
+                },
+                Column {
+                    tiles: vec![2],
+                    width: ColumnWidth::new(0.5),
+                },
+                Column {
+                    tiles: vec![3],
+                    width: ColumnWidth::new(0.5),
+                },
+            ],
+            ..Default::default()
+        };
+        model.viewport_width = 1_000;
+        model.gap = 0;
+        model.focused = Some(1);
+        model
+    }
+
+    #[test]
+    fn scroll_focus_waits_for_the_threshold() {
+        let mut model = three_half_width_columns();
+        // Columns are 500 wide at 0, 500, 1000. Viewport 0..1000 shows 1 and 2
+        // completely; 1 is focused and covers as much, so nothing changes.
+        assert_eq!(model.scroll_focus_candidate(0.6), None);
+        // Viewport 400..1400: column 1 shows 100, column 2 shows 500, column 3
+        // shows 400 (80%). Column 2 covers the most and wins.
+        model.viewport_x = 400.0;
+        assert_eq!(model.scroll_focus_candidate(0.6), Some(2));
+    }
+
+    #[test]
+    fn scroll_focus_ignores_a_sliver_at_the_edge() {
+        let mut model = three_half_width_columns();
+        model.focused = Some(2);
+        // Viewport 250..1250: column 3 shows 250 (50%), below a 60% threshold.
+        model.viewport_x = 250.0;
+        assert_eq!(model.scroll_focus_candidate(0.6), None);
+        // At a 40% threshold it qualifies, but column 2 still covers more.
+        assert_eq!(model.scroll_focus_candidate(0.4), None);
+    }
+
+    #[test]
+    fn scroll_focus_moves_once_the_new_column_dominates() {
+        let mut model = three_half_width_columns();
+        model.focused = Some(2);
+        // Viewport 900..1900: column 2 shows 100, column 3 shows all 500.
+        model.viewport_x = 900.0;
+        assert_eq!(model.scroll_focus_candidate(0.6), Some(3));
+    }
+
+    #[test]
+    fn focus_without_scroll_keeps_the_viewport() {
+        let mut model = three_half_width_columns();
+        model.viewport_x = 400.0;
+        model.user_positioned_viewport = true;
+        assert!(model.focus_without_scroll(&2));
+        assert_eq!(model.focused, Some(2));
+        assert_viewport(&model, 400.0);
+        assert!(model.user_positioned_viewport);
+        assert!(!model.focus_without_scroll(&99));
+    }
+
+    #[test]
+    fn new_column_fraction_is_clamped() {
+        // Uses the conversion directly so parallel tests never see a changed
+        // global width.
+        let clamp = |f: f64| {
+            if f.is_finite() {
+                f.clamp(MIN_COLUMN_FRACTION, MAX_COLUMN_FRACTION)
+            } else {
+                DEFAULT_COLUMN_FRACTION
+            }
+        };
+        assert_eq!(clamp(0.1), 0.25);
+        assert_eq!(clamp(2.0), 1.0);
+        assert_eq!(clamp(f64::NAN), DEFAULT_COLUMN_FRACTION);
+        assert_eq!(clamp(0.9), 0.9);
+    }
+
+    #[test]
+    fn full_width_toggle_restores_the_previous_width() {
+        let mut model = three_half_width_columns();
+        assert!(model.toggle_full_width(&2));
+        assert_eq!(width_fractions(&model), [0.5, 1.0, 0.5]);
+        assert_eq!(model.focused, Some(2));
+        assert!(model.toggle_full_width(&2));
+        assert_eq!(width_fractions(&model), [0.5, 0.5, 0.5]);
+        assert!(!model.toggle_full_width(&99));
+    }
+
+    #[test]
+    fn full_width_toggle_leaves_an_already_full_column_alone() {
+        let mut model = three_half_width_columns();
+        model.columns[0].width = ColumnWidth::new(1.0);
+        assert!(!model.toggle_full_width(&1));
+        assert_eq!(width_fractions(&model), [1.0, 0.5, 0.5]);
     }
 }
