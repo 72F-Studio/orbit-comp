@@ -96,8 +96,40 @@ impl TilingEngine {
     }
 }
 
+/// Orbit: how the strip scrolls when focus moves to another column.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+pub enum CenteringPolicy {
+    /// Scroll only as far as needed to show the focused column.
+    #[default]
+    Lazy,
+    /// Always centre the focused column.
+    Always,
+    /// Centre the focused column only when it isn't already fully visible.
+    OnOverflow,
+}
+
+/// Orbit: where a newly opened window's column goes in the strip.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+pub enum NewWindowPosition {
+    /// Right after the focused column.
+    #[default]
+    AfterFocused,
+    /// At the end of the strip.
+    End,
+}
+
+/// Orbit: open windows of one app at a set column width.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct WidthRule {
+    /// Matches the window's app ID exactly, ignoring case (for example
+    /// `org.kde.kate` or `firefox`).
+    pub app_id: String,
+    /// Column width as a fraction of the output width.
+    pub width: f64,
+}
+
 /// Orbit: settings for the Scrolling tiling engine.
-#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ScrollingConfig {
     /// Width of a newly opened window's column, as a fraction of the output
@@ -111,6 +143,19 @@ pub struct ScrollingConfig {
     pub focus_scroll_threshold: f64,
     /// Blur the wallpaper and desktop icons behind scrolling workspaces.
     pub backdrop_blur: bool,
+    /// How the strip scrolls when focus moves.
+    pub centering: CenteringPolicy,
+    /// Centre the column when a workspace has only one.
+    pub center_single_column: bool,
+    /// Where new windows open.
+    pub new_window_position: NewWindowPosition,
+    /// Opacity of windows that are partly off screen. 1.0 turns dimming off.
+    pub offscreen_opacity: f64,
+    /// Show a thin bar at the bottom of the screen marking which part of the
+    /// strip is visible, when the strip is wider than the screen.
+    pub position_indicator: bool,
+    /// Per-app widths for new windows, checked before `new_column_width`.
+    pub width_rules: Vec<WidthRule>,
 }
 
 impl ScrollingConfig {
@@ -126,6 +171,25 @@ impl ScrollingConfig {
         } else {
             Self::default().new_column_width
         }
+    }
+
+    /// `offscreen_opacity`, made safe to use even if the stored value is bad.
+    pub fn clamped_offscreen_opacity(&self) -> f64 {
+        if self.offscreen_opacity.is_finite() {
+            self.offscreen_opacity.clamp(0.2, 1.0)
+        } else {
+            1.0
+        }
+    }
+
+    /// The width a new window of `app_id` should open with.
+    pub fn new_column_width_for(&self, app_id: &str) -> f64 {
+        self.width_rules
+            .iter()
+            .find(|rule| !rule.app_id.is_empty() && rule.app_id.eq_ignore_ascii_case(app_id))
+            .filter(|rule| rule.width.is_finite())
+            .map(|rule| rule.width.clamp(Self::MIN_COLUMN_WIDTH, 1.0))
+            .unwrap_or_else(|| self.clamped_new_column_width())
     }
 
     /// `focus_scroll_threshold`, made safe to use even if the stored value is bad.
@@ -145,6 +209,12 @@ impl Default for ScrollingConfig {
             focus_follows_scroll: false,
             focus_scroll_threshold: 0.6,
             backdrop_blur: true,
+            centering: CenteringPolicy::Lazy,
+            center_single_column: false,
+            new_window_position: NewWindowPosition::AfterFocused,
+            offscreen_opacity: 1.0,
+            position_indicator: true,
+            width_rules: Vec::new(),
         }
     }
 }
@@ -550,6 +620,45 @@ mod tests {
         config.focus_scroll_threshold = f64::INFINITY;
         assert_eq!(config.clamped_new_column_width(), 0.5);
         assert_eq!(config.clamped_focus_scroll_threshold(), 0.6);
+    }
+
+    #[test]
+    fn width_rules_match_app_ids_case_insensitively() {
+        let config = ScrollingConfig {
+            width_rules: vec![
+                WidthRule {
+                    app_id: "org.kde.Kate".into(),
+                    width: 0.9,
+                },
+                WidthRule {
+                    app_id: "tiny".into(),
+                    width: 0.05,
+                },
+                WidthRule {
+                    app_id: String::new(),
+                    width: 0.3,
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(config.new_column_width_for("org.kde.kate"), 0.9);
+        assert_eq!(
+            config.new_column_width_for("tiny"),
+            ScrollingConfig::MIN_COLUMN_WIDTH
+        );
+        assert_eq!(config.new_column_width_for(""), 0.5);
+        assert_eq!(config.new_column_width_for("brave-browser"), 0.5);
+    }
+
+    #[test]
+    fn scrolling_config_reads_rules_from_ron() {
+        let config: ScrollingConfig = ron::from_str(
+            "(centering: OnOverflow, width_rules: [(app_id: \"firefox\", width: 0.75)])",
+        )
+        .unwrap();
+        assert_eq!(config.centering, CenteringPolicy::OnOverflow);
+        assert_eq!(config.new_column_width_for("firefox"), 0.75);
+        assert_eq!(config.offscreen_opacity, 1.0);
     }
 
     #[test]

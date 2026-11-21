@@ -824,8 +824,11 @@ impl TilingLayout {
         if self.tiling_engine == TilingEngine::Scrolling
             && let Some(new_id) = window.tiling_node_id.lock().unwrap().clone()
         {
+            // Orbit: a per-app width rule wins over the new-window width.
+            let fraction =
+                crate::shell::layout::scrolling::width_rule_for(&window.active_window().app_id());
             self.scrolling
-                .insert_new_toplevel(new_id, last_active.as_ref());
+                .insert_new_toplevel(new_id, last_active.as_ref(), fraction);
         }
 
         let blocker = self.update_positions_for(&mut tree, gaps);
@@ -7193,7 +7196,7 @@ mod tests {
         let new = insert(&mut tree);
         layout
             .scrolling
-            .insert_new_toplevel(new.clone(), Some(&first));
+            .insert_new_toplevel(new.clone(), Some(&first), None);
         layout.update_positions_for(&mut tree, layout.gaps());
 
         assert_eq!(

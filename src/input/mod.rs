@@ -1363,13 +1363,15 @@ impl State {
                                             None => gesture_state.action = None,
                                         }
                                         // Orbit: optionally focus the window panned into.
-                                        let scrolling = self.common.config.cosmic_conf.scrolling;
-                                        if panned == Some(true) && scrolling.focus_follows_scroll {
+                                        let scrolling = &self.common.config.cosmic_conf.scrolling;
+                                        let follow = scrolling.focus_follows_scroll;
+                                        let threshold = scrolling.clamped_focus_scroll_threshold();
+                                        if panned == Some(true) && follow {
                                             let focus =
                                                 self.common.shell.write().scroll_focus_target(
                                                     &target.output,
                                                     target.workspace,
-                                                    scrolling.clamped_focus_scroll_threshold(),
+                                                    threshold,
                                                 );
                                             if let Some(mapped) = focus {
                                                 Shell::set_focus(

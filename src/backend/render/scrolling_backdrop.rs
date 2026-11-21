@@ -11,7 +11,7 @@
 
 use std::sync::{
     Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU32, Ordering},
 };
 
 use cosmic_comp_config::TilingEngine;
@@ -43,6 +43,32 @@ static BACKDROP_BLUR_ENABLED: AtomicBool = AtomicBool::new(true);
 /// Turn the backdrop blur on or off for every output.
 pub fn set_backdrop_blur_enabled(enabled: bool) {
     BACKDROP_BLUR_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// Follows `scrolling.offscreen_opacity`, stored as `f32` bits. 1.0 is off.
+static OFFSCREEN_OPACITY: AtomicU32 = AtomicU32::new(0x3f80_0000); // 1.0
+
+/// Set the opacity of windows that are partly off screen.
+pub fn set_offscreen_opacity(opacity: f32) {
+    OFFSCREEN_OPACITY.store(opacity.clamp(0.2, 1.0).to_bits(), Ordering::Relaxed);
+}
+
+/// Opacity for partly off-screen windows on scrolling workspaces.
+pub fn offscreen_opacity() -> f32 {
+    f32::from_bits(OFFSCREEN_OPACITY.load(Ordering::Relaxed))
+}
+
+/// Follows `scrolling.position_indicator`.
+static POSITION_INDICATOR_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Turn the strip position indicator on or off.
+pub fn set_position_indicator_enabled(enabled: bool) {
+    POSITION_INDICATOR_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// Whether the strip position indicator should be drawn.
+pub fn position_indicator_enabled() -> bool {
+    POSITION_INDICATOR_ENABLED.load(Ordering::Relaxed)
 }
 
 /// Whether `workspace` should get the backdrop blur: tiling is on, it uses the

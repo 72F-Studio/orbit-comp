@@ -85,8 +85,27 @@ pub struct Config {
 /// Orbit: push the Scrolling settings that rendering and layout read
 /// directly. Focus-follows-scroll is read from the config where it's used.
 fn apply_scrolling_config(scrolling: &ScrollingConfig) {
-    crate::shell::layout::scrolling::set_new_column_fraction(scrolling.clamped_new_column_width());
+    use crate::shell::layout::scrolling::{LayoutSettings, set_layout_settings};
+    set_layout_settings(
+        LayoutSettings {
+            new_column_fraction: scrolling.clamped_new_column_width(),
+            centering: scrolling.centering,
+            center_single_column: scrolling.center_single_column,
+            new_window_position: scrolling.new_window_position,
+        },
+        scrolling
+            .width_rules
+            .iter()
+            .map(|rule| (rule.app_id.clone(), rule.width))
+            .collect(),
+    );
     crate::backend::render::scrolling_backdrop::set_backdrop_blur_enabled(scrolling.backdrop_blur);
+    crate::backend::render::scrolling_backdrop::set_offscreen_opacity(
+        scrolling.clamped_offscreen_opacity() as f32,
+    );
+    crate::backend::render::scrolling_backdrop::set_position_indicator_enabled(
+        scrolling.position_indicator,
+    );
 }
 
 fn initial_tiling_engine(
@@ -1012,8 +1031,8 @@ fn config_changed(config: cosmic_config::Config, keys: Vec<String>, state: &mut 
             "scrolling" => {
                 let new = get_config::<ScrollingConfig>(&config, "scrolling");
                 if new != state.common.config.cosmic_conf.scrolling {
-                    state.common.config.cosmic_conf.scrolling = new;
                     apply_scrolling_config(&new);
+                    state.common.config.cosmic_conf.scrolling = new;
                     let outputs = state
                         .common
                         .shell

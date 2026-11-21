@@ -7,7 +7,9 @@
 //! screen coordinates by subtracting `viewport_x`.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::RwLock;
+
+use cosmic_comp_config::{CenteringPolicy, NewWindowPosition};
 
 use cosmic_settings_config::shortcuts::action::{Direction, FocusDirection, ResizeDirection};
 use id_tree::{NodeId, Tree};
@@ -26,25 +28,68 @@ const DEFAULT_COLUMN_FRACTION: f64 = 0.66;
 const COLUMN_WIDTH_PRESETS: [f64; 4] = [0.33, 0.5, 0.66, 1.0];
 const MIN_COLUMN_FRACTION: f64 = cosmic_comp_config::ScrollingConfig::MIN_COLUMN_WIDTH;
 
-/// Width given to the column of a newly opened window, stored as `f64` bits.
-/// Set from the `scrolling.new_column_width` setting; tests keep the default.
-static NEW_COLUMN_FRACTION: AtomicU64 = AtomicU64::new(DEFAULT_COLUMN_FRACTION.to_bits());
+/// Orbit: the user's Scrolling layout settings, as the column model uses them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LayoutSettings {
+    /// Width of a newly opened window's column when no width rule matches.
+    pub new_column_fraction: f64,
+    pub centering: CenteringPolicy,
+    pub center_single_column: bool,
+    pub new_window_position: NewWindowPosition,
+}
 
-/// Apply the user's new-window width. Existing columns keep their widths.
-pub fn set_new_column_fraction(fraction: f64) {
-    let fraction = if fraction.is_finite() {
+impl Default for LayoutSettings {
+    /// Matches the layout's built-in behaviour, so tests that don't set
+    /// anything see the original prototype layout.
+    fn default() -> Self {
+        Self {
+            new_column_fraction: DEFAULT_COLUMN_FRACTION,
+            centering: CenteringPolicy::Lazy,
+            center_single_column: false,
+            new_window_position: NewWindowPosition::AfterFocused,
+        }
+    }
+}
+
+/// Set from the `scrolling` config key. Each layout copies it into its model
+/// before laying out, so one change applies to every workspace.
+static LAYOUT_SETTINGS: RwLock<Option<LayoutSettings>> = RwLock::new(None);
+
+/// Per-app widths from the `scrolling.width_rules` setting.
+static WIDTH_RULES: RwLock<Vec<(String, f64)>> = RwLock::new(Vec::new());
+
+/// Apply new Scrolling layout settings. Existing column widths are kept.
+pub fn set_layout_settings(mut settings: LayoutSettings, width_rules: Vec<(String, f64)>) {
+    settings.new_column_fraction = clamp_fraction(settings.new_column_fraction);
+    *LAYOUT_SETTINGS.write().unwrap() = Some(settings);
+    *WIDTH_RULES.write().unwrap() = width_rules;
+}
+
+fn layout_settings() -> LayoutSettings {
+    LAYOUT_SETTINGS.read().unwrap().unwrap_or_default()
+}
+
+/// The width rule for `app_id`, if one matches (case-insensitive).
+pub fn width_rule_for(app_id: &str) -> Option<f64> {
+    if app_id.is_empty() {
+        return None;
+    }
+    WIDTH_RULES
+        .read()
+        .unwrap()
+        .iter()
+        .find(|(rule, _)| rule.eq_ignore_ascii_case(app_id))
+        .map(|(_, width)| clamp_fraction(*width))
+}
+
+fn clamp_fraction(fraction: f64) -> f64 {
+    if fraction.is_finite() {
         fraction.clamp(MIN_COLUMN_FRACTION, MAX_COLUMN_FRACTION)
     } else {
         DEFAULT_COLUMN_FRACTION
-    };
-    NEW_COLUMN_FRACTION.store(fraction.to_bits(), AtomicOrdering::Relaxed);
+    }
 }
 
-fn new_column_width() -> ColumnWidth {
-    ColumnWidth::new(f64::from_bits(
-        NEW_COLUMN_FRACTION.load(AtomicOrdering::Relaxed),
-    ))
-}
 const MAX_COLUMN_FRACTION: f64 = 1.0;
 const MIN_TILE_HEIGHT: i32 = 240;
 
@@ -177,6 +222,7 @@ impl ScrollingLayout {
         preserve_viewport: bool,
         live_resize: Option<(&[NodeId], bool)>,
     ) -> Option<TilingBlocker> {
+        self.model.settings = layout_settings();
         let requested_center = self.pending_center.take();
         let preserved_viewport = preserve_viewport.then_some(self.model.viewport_x);
         let Some(root_id) = tree.root_node_id().cloned() else {
@@ -502,8 +548,16 @@ impl ScrollingLayout {
     /// after the focused column. Generic reconciliation deliberately does not
     /// use this policy because unknown identities can also be restored tiles,
     /// drag replacements, or leaves first observed after an engine switch.
-    pub(super) fn insert_new_toplevel(&mut self, tile: NodeId, focused: Option<&NodeId>) {
-        self.model.insert_new_toplevel(tile, focused);
+    pub(super) fn insert_new_toplevel(
+        &mut self,
+        tile: NodeId,
+        focused: Option<&NodeId>,
+        fraction: Option<f64>,
+    ) {
+        self.model.settings = layout_settings();
+        let fraction = fraction.unwrap_or(self.model.settings.new_column_fraction);
+        self.model
+            .insert_new_toplevel_with_width(tile, focused, fraction);
     }
 
     pub(super) fn resize_column_by_pixels(
@@ -846,10 +900,10 @@ impl<T> Column<T> {
 
     /// A column for a window that has just appeared, at the user's
     /// new-window width.
-    fn new_window(tile: T) -> Self {
+    fn new_window(tile: T, fraction: f64) -> Self {
         Self {
             tiles: vec![tile],
-            width: new_column_width(),
+            width: ColumnWidth::new(clamp_fraction(fraction)),
         }
     }
 }
@@ -877,6 +931,8 @@ struct ColumnModel<T> {
     /// Orbit: widths to restore when a full-width (maximized) column is
     /// toggled back, keyed by the tile that asked for it.
     full_width_restore: Vec<(T, ColumnWidth)>,
+    /// Orbit: the user's layout settings, copied in before each layout pass.
+    settings: LayoutSettings,
 }
 
 impl<T> Default for ColumnModel<T> {
@@ -892,6 +948,7 @@ impl<T> Default for ColumnModel<T> {
             gap: 0,
             column_height: 0,
             full_width_restore: Vec::new(),
+            settings: LayoutSettings::default(),
         }
     }
 }
@@ -953,7 +1010,8 @@ where
             if !retained.contains(&tile) {
                 retained.push(tile.clone());
                 self.tile_weights.push((tile.clone(), 1.0));
-                self.columns.push(Column::new_window(tile));
+                self.columns
+                    .push(Column::new_window(tile, self.settings.new_column_fraction));
             }
         }
 
@@ -973,16 +1031,26 @@ where
     /// Insert a confirmed new toplevel without making tree preorder
     /// authoritative for ordinary reconciliation.
     fn insert_new_toplevel(&mut self, tile: T, focused: Option<&T>) {
+        let fraction = self.settings.new_column_fraction;
+        self.insert_new_toplevel_with_width(tile, focused, fraction);
+    }
+
+    /// Orbit: insert a new window at `fraction` width, where the user's
+    /// new-window position setting says.
+    fn insert_new_toplevel_with_width(&mut self, tile: T, focused: Option<&T>, fraction: f64) {
         // Be defensive if a caller repeats notification for the same identity:
         // each tile must still belong to exactly one column.
         self.remove_tile(&tile);
 
-        let insertion = focused
-            .and_then(|focused| self.tile_position(focused))
-            .map(|(column, _)| column + 1)
-            .unwrap_or(self.columns.len());
+        let insertion = match self.settings.new_window_position {
+            NewWindowPosition::End => self.columns.len(),
+            NewWindowPosition::AfterFocused => focused
+                .and_then(|focused| self.tile_position(focused))
+                .map(|(column, _)| column + 1)
+                .unwrap_or(self.columns.len()),
+        };
         self.columns
-            .insert(insertion, Column::new_window(tile.clone()));
+            .insert(insertion, Column::new_window(tile.clone(), fraction));
         self.set_tile_weight(tile, 1.0);
         self.clamp_viewport();
     }
@@ -1504,11 +1572,23 @@ where
         let old_viewport = self.viewport_x;
         let left = self.layout_x(column);
         let right = left + self.column_width(column) as f64;
-        if left < self.viewport_x {
+        let fully_visible =
+            left >= self.viewport_x && right <= self.viewport_x + self.viewport_width as f64;
+        let center = match self.settings.centering {
+            CenteringPolicy::Lazy => false,
+            CenteringPolicy::Always => true,
+            CenteringPolicy::OnOverflow => !fully_visible,
+        };
+        if center {
+            self.viewport_x = left + (right - left) / 2.0 - self.viewport_width as f64 / 2.0;
+            self.clamp_viewport();
+        } else if left < self.viewport_x {
             self.viewport_x = left;
             self.clamp_viewport();
         } else if right > self.viewport_x + self.viewport_width as f64 {
             self.viewport_x = right - self.viewport_width as f64;
+            self.clamp_viewport();
+        } else if self.settings.center_single_column {
             self.clamp_viewport();
         }
 
@@ -1714,6 +1794,12 @@ where
             let min_viewport = first_center - viewport_width / 2.0;
             let max_viewport = last_center - viewport_width / 2.0;
             self.viewport_x = self.viewport_x.clamp(min_viewport, max_viewport);
+        } else if self.settings.center_single_column
+            && self.columns.len() == 1
+            && self.column_width(0) < self.viewport_width
+        {
+            // Orbit: a lone narrower column sits in the middle of the screen.
+            self.viewport_x = (self.column_width(0) - self.viewport_width) as f64 / 2.0;
         } else {
             let max_viewport = (self.strip_width() - self.viewport_width.max(0) as f64).max(0.0);
             self.viewport_x = self.viewport_x.clamp(0.0, max_viewport);
@@ -3513,5 +3599,92 @@ mod tests {
         model.columns[0].width = ColumnWidth::new(1.0);
         assert!(!model.toggle_full_width(&1));
         assert_eq!(width_fractions(&model), [1.0, 0.5, 0.5]);
+    }
+
+    // --- Orbit: layout settings --------------------------------------------
+
+    fn four_half_columns(settings: LayoutSettings) -> ColumnModel<i32> {
+        let mut model = ColumnModel {
+            columns: (1..=4)
+                .map(|tile| Column {
+                    tiles: vec![tile],
+                    width: ColumnWidth::new(0.5),
+                })
+                .collect(),
+            settings,
+            ..Default::default()
+        };
+        model.viewport_width = 1_000;
+        model.focused = Some(1);
+        model
+    }
+
+    #[test]
+    fn always_centering_centres_the_focused_column() {
+        let mut model = four_half_columns(LayoutSettings {
+            centering: CenteringPolicy::Always,
+            ..Default::default()
+        });
+        // Column 3 is at 1000..1500; centred means viewport 750..1750.
+        assert!(model.ensure_visible(&3));
+        assert_viewport(&model, 750.0);
+    }
+
+    #[test]
+    fn on_overflow_centering_only_moves_for_hidden_columns() {
+        let mut model = four_half_columns(LayoutSettings {
+            centering: CenteringPolicy::OnOverflow,
+            ..Default::default()
+        });
+        // Column 2 (500..1000) is already fully visible: no movement.
+        assert!(!model.ensure_visible(&2));
+        assert_viewport(&model, 0.0);
+        // Column 3 is hidden: centre it.
+        assert!(model.ensure_visible(&3));
+        assert_viewport(&model, 750.0);
+    }
+
+    #[test]
+    fn lazy_centering_scrolls_just_enough() {
+        let mut model = four_half_columns(LayoutSettings::default());
+        assert!(model.ensure_visible(&3));
+        assert_viewport(&model, 500.0);
+    }
+
+    #[test]
+    fn a_lone_column_is_centred_when_asked() {
+        let mut model = ColumnModel {
+            columns: vec![Column {
+                tiles: vec![1],
+                width: ColumnWidth::new(0.5),
+            }],
+            settings: LayoutSettings {
+                center_single_column: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        model.viewport_width = 1_000;
+        model.clamp_viewport();
+        assert_viewport(&model, -250.0);
+    }
+
+    #[test]
+    fn new_windows_can_open_at_the_end_of_the_strip() {
+        let mut model = four_half_columns(LayoutSettings {
+            new_window_position: NewWindowPosition::End,
+            ..Default::default()
+        });
+        model.insert_new_toplevel_with_width(9, Some(&1), 0.75);
+        assert_eq!(
+            tile_columns(&model),
+            vec![vec![1], vec![2], vec![3], vec![4], vec![9]]
+        );
+        assert_eq!(width_fractions(&model)[4], 0.75);
+
+        let mut after = four_half_columns(LayoutSettings::default());
+        after.insert_new_toplevel_with_width(9, Some(&1), 0.1);
+        assert_eq!(tile_columns(&after)[1], vec![9]);
+        assert_eq!(width_fractions(&after)[1], MIN_COLUMN_FRACTION);
     }
 }
