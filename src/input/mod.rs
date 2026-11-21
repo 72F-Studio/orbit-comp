@@ -8,8 +8,8 @@ use crate::{
     config::{
         Action, Config, PrivateAction,
         key_bindings::{
-            center_scrolling_binding, cosmic_keystate_from_smithay, cosmic_modifiers_eq_smithay,
-            cosmic_modifiers_from_smithay,
+            cosmic_keystate_from_smithay, cosmic_modifiers_eq_smithay,
+            cosmic_modifiers_from_smithay, scrolling_bindings,
         },
     },
     input::{
@@ -2795,18 +2795,17 @@ impl State {
             // shortcut claims the same binding.
             if !configured_key_binding
                 && key_state == KeyState::Pressed
-                && self.common.shell.read().scrolling_tiling_active(seat)
+                && self.common.shell.read().scrolling_workspace_active(seat)
             {
-                let binding = center_scrolling_binding();
-                if binding.key.is_some_and(key_matches)
-                    && cosmic_modifiers_eq_smithay(&binding.modifiers, modifiers)
-                {
-                    modifiers_queue.clear(backend_id);
-                    seat.supressed_keys().add(backend_id, &handle, None);
-                    return FilterResult::Intercept(Some((
-                        Action::Private(PrivateAction::CenterScrollingColumn),
-                        binding,
-                    )));
+                // Orbit: Super+C and the strip shortcuts.
+                for (binding, action) in scrolling_bindings() {
+                    if binding.key.is_some_and(key_matches)
+                        && cosmic_modifiers_eq_smithay(&binding.modifiers, modifiers)
+                    {
+                        modifiers_queue.clear(backend_id);
+                        seat.supressed_keys().add(backend_id, &handle, None);
+                        return FilterResult::Intercept(Some((Action::Private(action), binding)));
+                    }
                 }
             }
         }

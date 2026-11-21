@@ -93,6 +93,23 @@ fn clamp_fraction(fraction: f64) -> f64 {
 const MAX_COLUMN_FRACTION: f64 = 1.0;
 const MIN_TILE_HEIGHT: i32 = 240;
 
+/// Orbit: keyboard actions on the strip, adapted from PaperWM and Karousel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StripAction {
+    /// Scroll the view one column left (-1) or right (1), keeping focus.
+    ScrollView(isize),
+    /// Focus the first (false) or last (true) column.
+    FocusEdge(bool),
+    /// Move the focused column left (-1) or right (1) with all its windows.
+    MoveColumn(isize),
+    /// Move the focused column to the start (false) or end (true).
+    MoveColumnToEdge(bool),
+    /// Give the columns on screen equal widths.
+    Equalize,
+    /// Widen the focused column into free screen space.
+    Expand,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum FocusNavigation {
     Target(NodeId),
@@ -419,6 +436,52 @@ impl ScrollingLayout {
     /// Orbit: the tile a pan has scrolled into, if focus should follow it.
     pub(super) fn scroll_focus_candidate(&self, threshold: f64) -> Option<NodeId> {
         self.model.scroll_focus_candidate(threshold)
+    }
+
+    /// Orbit: scroll the view one column without moving focus.
+    pub(super) fn scroll_by_column(&mut self, delta: isize) -> bool {
+        self.model.scroll_by_column(delta)
+    }
+
+    /// Orbit: the top tile of the first or last column.
+    pub(super) fn edge_tile(&self, last: bool) -> Option<NodeId> {
+        self.model.edge_tile(last)
+    }
+
+    /// Orbit: move the whole focused column by `delta` places.
+    pub(super) fn move_column_by(&mut self, current: &NodeId, delta: isize) -> bool {
+        if !self.model.move_column_by(current, delta) {
+            return false;
+        }
+        self.model.ensure_visible(current);
+        true
+    }
+
+    /// Orbit: move the whole focused column to the start or end.
+    pub(super) fn move_column_to_edge(&mut self, current: &NodeId, last: bool) -> bool {
+        if !self.model.move_column_to_edge(current, last) {
+            return false;
+        }
+        self.model.ensure_visible(current);
+        true
+    }
+
+    /// Orbit: equal widths for the columns on screen.
+    pub(super) fn equalize_visible(&mut self, current: &NodeId) -> bool {
+        if !self.model.equalize_visible(current) {
+            return false;
+        }
+        self.model.ensure_visible(current);
+        true
+    }
+
+    /// Orbit: widen the focused column into free screen space.
+    pub(super) fn expand_to_fill(&mut self, current: &NodeId) -> bool {
+        if !self.model.expand_to_fill(current) {
+            return false;
+        }
+        self.model.ensure_visible(current);
+        true
     }
 
     /// Orbit: maximize for Scrolling; see `ColumnModel::toggle_full_width`.
@@ -1410,6 +1473,154 @@ where
 
         self.columns.swap(column, target);
         self.focused = Some(current.clone());
+        true
+    }
+
+    // --- Orbit: strip actions from PaperWM and Karousel ----------------------
+
+    /// Scroll the view one column left (`delta < 0`) or right without moving
+    /// focus: the next column edge in that direction lines up with the left
+    /// side of the screen.
+    fn scroll_by_column(&mut self, delta: isize) -> bool {
+        if self.viewport_width <= 0 || self.columns.is_empty() || delta == 0 {
+            return false;
+        }
+        let edges = (0..self.columns.len()).map(|index| self.layout_x(index));
+        let target = if delta > 0 {
+            edges
+                .filter(|x| *x > self.viewport_x + 1.0)
+                .reduce(f64::min)
+        } else {
+            edges
+                .filter(|x| *x < self.viewport_x - 1.0)
+                .reduce(f64::max)
+        };
+        let Some(target) = target else {
+            return false;
+        };
+        let old_viewport = self.viewport_x;
+        self.user_positioned_viewport = true;
+        self.viewport_x = target;
+        self.clamp_viewport();
+        (self.viewport_x - old_viewport).abs() > f64::EPSILON
+    }
+
+    /// The top tile of the first (`last == false`) or last column.
+    fn edge_tile(&self, last: bool) -> Option<T> {
+        let column = if last {
+            self.columns.last()?
+        } else {
+            self.columns.first()?
+        };
+        column.tiles.first().cloned()
+    }
+
+    /// Move the whole column containing `current` by `delta` places, keeping
+    /// all of its tiles together. Returns false at the strip edge.
+    fn move_column_by(&mut self, current: &T, delta: isize) -> bool {
+        let Some((column, _)) = self.tile_position(current) else {
+            return false;
+        };
+        let Some(target) = column.checked_add_signed(delta) else {
+            return false;
+        };
+        if target >= self.columns.len() || target == column {
+            return false;
+        }
+        let moved = self.columns.remove(column);
+        self.columns.insert(target, moved);
+        self.focused = Some(current.clone());
+        true
+    }
+
+    /// Move the whole column containing `current` to the start or end.
+    fn move_column_to_edge(&mut self, current: &T, last: bool) -> bool {
+        let Some((column, _)) = self.tile_position(current) else {
+            return false;
+        };
+        let target = if last { self.columns.len() - 1 } else { 0 };
+        if target == column {
+            return false;
+        }
+        let moved = self.columns.remove(column);
+        self.columns.insert(target, moved);
+        self.focused = Some(current.clone());
+        true
+    }
+
+    /// Indices of columns that are at least half on screen.
+    fn mostly_visible_columns(&self) -> Vec<usize> {
+        let left = self.viewport_x;
+        let right = left + self.viewport_width as f64;
+        (0..self.columns.len())
+            .filter(|&index| {
+                let start = self.layout_x(index);
+                let width = self.column_width(index) as f64;
+                let visible = ((start + width).min(right) - start.max(left)).max(0.0);
+                visible * 2.0 >= width
+            })
+            .collect()
+    }
+
+    /// Give every mostly visible column the same width, so together they fill
+    /// the screen. The focused column stays among them.
+    fn equalize_visible(&mut self, current: &T) -> bool {
+        if self.viewport_width <= 0 {
+            return false;
+        }
+        let Some((focused, _)) = self.tile_position(current) else {
+            return false;
+        };
+        let mut visible = self.mostly_visible_columns();
+        if !visible.contains(&focused) {
+            visible.push(focused);
+            visible.sort_unstable();
+        }
+        let count = visible.len() as f64;
+        let free = self.viewport_width as f64 - self.gap as f64 * (count - 1.0);
+        let fraction = clamp_fraction(free / count / self.viewport_width as f64);
+        let mut changed = false;
+        for index in visible {
+            if (self.columns[index].width.fraction - fraction).abs() > f64::EPSILON {
+                self.columns[index].width = ColumnWidth::new(fraction);
+                changed = true;
+            }
+        }
+        self.focused = Some(current.clone());
+        self.user_positioned_viewport = false;
+        changed
+    }
+
+    /// Widen the focused column into the screen space that the other fully
+    /// visible columns leave free.
+    fn expand_to_fill(&mut self, current: &T) -> bool {
+        if self.viewport_width <= 0 {
+            return false;
+        }
+        let Some((focused, _)) = self.tile_position(current) else {
+            return false;
+        };
+        let left = self.viewport_x;
+        let right = left + self.viewport_width as f64;
+        let others = (0..self.columns.len())
+            .filter(|&index| index != focused)
+            .filter(|&index| {
+                let start = self.layout_x(index);
+                start >= left && start + self.column_width(index) as f64 <= right
+            })
+            .collect::<Vec<_>>();
+        let used = others
+            .iter()
+            .map(|&index| self.column_width(index) as f64 + self.gap as f64)
+            .sum::<f64>();
+        let fraction =
+            clamp_fraction((self.viewport_width as f64 - used) / self.viewport_width as f64);
+        self.focused = Some(current.clone());
+        self.user_positioned_viewport = false;
+        if fraction <= self.columns[focused].width.fraction + f64::EPSILON {
+            return false;
+        }
+        self.columns[focused].width = ColumnWidth::new(fraction);
         true
     }
 
@@ -3686,5 +3897,87 @@ mod tests {
         after.insert_new_toplevel_with_width(9, Some(&1), 0.1);
         assert_eq!(tile_columns(&after)[1], vec![9]);
         assert_eq!(width_fractions(&after)[1], MIN_COLUMN_FRACTION);
+    }
+
+    // --- Orbit: strip actions ---------------------------------------------
+
+    #[test]
+    fn scroll_by_column_steps_between_column_edges_without_focus() {
+        let mut model = four_half_columns(LayoutSettings::default());
+        assert!(model.scroll_by_column(1));
+        assert_viewport(&model, 500.0);
+        assert!(model.scroll_by_column(1));
+        assert_viewport(&model, 1_000.0);
+        assert_eq!(model.focused, Some(1));
+        assert!(model.scroll_by_column(-1));
+        assert_viewport(&model, 500.0);
+    }
+
+    #[test]
+    fn edge_tiles_are_the_tops_of_the_first_and_last_columns() {
+        let model = four_half_columns(LayoutSettings::default());
+        assert_eq!(model.edge_tile(false), Some(1));
+        assert_eq!(model.edge_tile(true), Some(4));
+        assert_eq!(ColumnModel::<i32>::default().edge_tile(true), None);
+    }
+
+    #[test]
+    fn whole_columns_move_with_all_their_tiles() {
+        let mut model = four_half_columns(LayoutSettings::default());
+        model.columns[1].tiles.push(5);
+        assert!(model.move_column_by(&5, 1));
+        assert_eq!(
+            tile_columns(&model),
+            vec![vec![1], vec![3], vec![2, 5], vec![4]]
+        );
+        assert!(model.move_column_to_edge(&2, false));
+        assert_eq!(
+            tile_columns(&model),
+            vec![vec![2, 5], vec![1], vec![3], vec![4]]
+        );
+        assert!(model.move_column_to_edge(&2, true));
+        assert_eq!(
+            tile_columns(&model),
+            vec![vec![1], vec![3], vec![4], vec![2, 5]]
+        );
+        assert!(!model.move_column_by(&2, 1));
+    }
+
+    #[test]
+    fn equalize_fills_the_screen_with_the_visible_columns() {
+        let mut model = four_half_columns(LayoutSettings::default());
+        model.gap = 0;
+        model.columns[0].width = ColumnWidth::new(0.25);
+        // Viewport 0..1000 shows column 1 (0..250), 2 (250..750) and half of 3.
+        assert!(model.equalize_visible(&1));
+        let widths = width_fractions(&model);
+        let third = 1.0 / 3.0;
+        assert!(
+            widths[..3].iter().all(|w| (w - third).abs() < 1e-9),
+            "{widths:?}"
+        );
+        assert_eq!(widths[3], 0.5);
+    }
+
+    #[test]
+    fn expand_fills_the_space_left_by_other_visible_columns() {
+        let mut model = ColumnModel {
+            columns: vec![
+                Column {
+                    tiles: vec![1],
+                    width: ColumnWidth::new(0.25),
+                },
+                Column {
+                    tiles: vec![2],
+                    width: ColumnWidth::new(0.25),
+                },
+            ],
+            ..Default::default()
+        };
+        model.viewport_width = 1_000;
+        model.gap = 0;
+        assert!(model.expand_to_fill(&2));
+        assert_eq!(width_fractions(&model), [0.25, 0.75]);
+        assert!(!model.expand_to_fill(&2));
     }
 }

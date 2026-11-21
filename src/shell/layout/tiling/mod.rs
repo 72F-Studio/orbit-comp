@@ -196,9 +196,15 @@ fn scrolling_drop_target(
     }
 }
 
+/// At the strip's edge, let COSMIC handle the move: up/down switch
+/// workspace, and left/right (Orbit) move focus to the monitor on that side.
+/// In/out have nothing to fall back to.
 fn scrolling_edge_focus_result(direction: FocusDirection) -> FocusResult {
     match direction {
-        FocusDirection::Up | FocusDirection::Down => FocusResult::None,
+        FocusDirection::Up
+        | FocusDirection::Down
+        | FocusDirection::Left
+        | FocusDirection::Right => FocusResult::None,
         _ => FocusResult::Handled,
     }
 }
@@ -2061,6 +2067,64 @@ impl TilingLayout {
             self.scrolling
                 .update_positions_ensuring(&self.output, &mut tree, gaps, Some(&node_id));
         self.push_scrolling_animation(tree, blocker);
+    }
+
+    /// Orbit: run a strip action. Returns `None` if the engine isn't
+    /// Scrolling, otherwise the window to focus next, if the action picks one.
+    pub fn scrolling_strip_action(
+        &mut self,
+        action: crate::shell::layout::scrolling::StripAction,
+        seat: &Seat<State>,
+    ) -> Option<Option<CosmicMapped>> {
+        use crate::shell::layout::scrolling::StripAction;
+        if self.tiling_engine != TilingEngine::Scrolling {
+            return None;
+        }
+        let focused = self.scrolling_focused_tile(seat);
+        let mut tree = self.queue.trees.back().unwrap().0.copy_clone();
+        let (changed, focus) = match action {
+            StripAction::ScrollView(delta) => (self.scrolling.scroll_by_column(delta), None),
+            StripAction::FocusEdge(last) => (false, self.scrolling.edge_tile(last)),
+            StripAction::MoveColumn(delta) => (
+                focused
+                    .as_ref()
+                    .is_some_and(|tile| self.scrolling.move_column_by(tile, delta)),
+                None,
+            ),
+            StripAction::MoveColumnToEdge(last) => (
+                focused
+                    .as_ref()
+                    .is_some_and(|tile| self.scrolling.move_column_to_edge(tile, last)),
+                None,
+            ),
+            StripAction::Equalize => (
+                focused
+                    .as_ref()
+                    .is_some_and(|tile| self.scrolling.equalize_visible(tile)),
+                None,
+            ),
+            StripAction::Expand => (
+                focused
+                    .as_ref()
+                    .is_some_and(|tile| self.scrolling.expand_to_fill(tile)),
+                None,
+            ),
+        };
+        if changed {
+            let gaps = self.gaps();
+            let blocker = self.scrolling.update_positions_ensuring(
+                &self.output,
+                &mut tree,
+                gaps,
+                focused.as_ref(),
+            );
+            self.push_scrolling_animation(tree, blocker);
+        }
+        let focus = focus.and_then(|node_id| match self.tree().get(&node_id).ok()?.data() {
+            Data::Mapped { mapped, .. } => Some(mapped.clone()),
+            _ => None,
+        });
+        Some(focus)
     }
 
     /// Orbit: maximize for Scrolling. Toggles `elem`'s column between full
@@ -7611,13 +7675,14 @@ mod tests {
             scrolling_edge_focus_result(FocusDirection::Down),
             FocusResult::None
         ));
+        // Orbit: left/right fall back too, to reach the next monitor.
         assert!(matches!(
             scrolling_edge_focus_result(FocusDirection::Left),
-            FocusResult::Handled
+            FocusResult::None
         ));
         assert!(matches!(
             scrolling_edge_focus_result(FocusDirection::Right),
-            FocusResult::Handled
+            FocusResult::None
         ));
     }
 

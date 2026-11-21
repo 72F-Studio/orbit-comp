@@ -287,6 +287,8 @@ pub struct Shell {
 
     // Can't make this into a HashSet. See https://github.com/pop-os/cosmic-comp/pull/1902
     pub pending_windows: Vec<PendingWindow>,
+    /// Orbit: floating windows hidden by the scratch-layer toggle, per workspace.
+    orbit_scratch_hidden: Vec<(WorkspaceHandle, Vec<CosmicSurface>)>,
     pub pending_layers: Vec<PendingLayer>,
     pub pending_activations: HashMap<ActivationKey, ActivationContext>,
     pub override_redirect_windows: Vec<X11Surface>,
@@ -1795,6 +1797,7 @@ impl Shell {
             seats: Seats::new(),
 
             pending_windows: Vec::new(),
+            orbit_scratch_hidden: Vec::new(),
             pending_layers: Vec::new(),
             pending_activations: HashMap::new(),
             override_redirect_windows: Vec::new(),
@@ -4459,6 +4462,74 @@ impl Shell {
             return false;
         };
         workspace.tiling_layer.center_scrolling_column(seat)
+    }
+
+    /// Orbit: whether the focused output's workspace is tiled with the
+    /// Scrolling engine, so Orbit's own shortcuts apply.
+    pub fn scrolling_workspace_active(&self, seat: &Seat<State>) -> bool {
+        let Some(output) = seat.focused_output() else {
+            return false;
+        };
+        self.active_space(&output).is_some_and(|workspace| {
+            workspace.tiling_enabled && workspace.tiling_layer.mode() == TilingEngine::Scrolling
+        })
+    }
+
+    /// Orbit: run a strip action on the focused output's workspace. Returns
+    /// the window to focus next, if the action picks one.
+    pub fn scrolling_strip_action(
+        &mut self,
+        seat: &Seat<State>,
+        action: crate::shell::layout::scrolling::StripAction,
+    ) -> Option<CosmicMapped> {
+        let output = seat.focused_output()?;
+        let workspace = self.active_space_mut(&output)?;
+        workspace
+            .tiling_layer
+            .scrolling_strip_action(action, seat)
+            .flatten()
+    }
+
+    /// Orbit: PaperWM-style scratch layer. Hides the floating windows of the
+    /// focused workspace by minimizing them, or brings back the ones it hid.
+    pub fn toggle_scratch_layer(
+        &mut self,
+        seat: &Seat<State>,
+        loop_handle: &LoopHandle<'static, State>,
+    ) {
+        let Some(output) = seat.focused_output() else {
+            return;
+        };
+        let Some(workspace) = self.active_space(&output) else {
+            return;
+        };
+        let handle = workspace.handle;
+        let visible = workspace
+            .floating_layer
+            .mapped()
+            .map(|mapped| mapped.active_window())
+            .collect::<Vec<_>>();
+
+        if visible.is_empty() {
+            let Some(index) = self
+                .orbit_scratch_hidden
+                .iter()
+                .position(|(owner, _)| *owner == handle)
+            else {
+                return;
+            };
+            let (_, hidden) = self.orbit_scratch_hidden.remove(index);
+            for window in hidden {
+                self.unminimize_request(&window, seat, loop_handle);
+            }
+        } else {
+            for window in &visible {
+                self.minimize_request(window, ModalBehavior::Ignore);
+            }
+            self.orbit_scratch_hidden
+                .retain(|(owner, _)| *owner != handle);
+            self.orbit_scratch_hidden.push((handle, visible));
+        }
     }
 
     pub fn scrolling_tiling_active(&self, seat: &Seat<State>) -> bool {

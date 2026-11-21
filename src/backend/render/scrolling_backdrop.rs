@@ -66,6 +66,24 @@ pub fn set_position_indicator_enabled(enabled: bool) {
     POSITION_INDICATOR_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
+/// Orbit: whether the strip overview (zoomed-out view) is shown.
+static STRIP_OVERVIEW: AtomicBool = AtomicBool::new(false);
+
+/// Toggle the strip overview.
+pub fn toggle_strip_overview() {
+    STRIP_OVERVIEW.fetch_xor(true, Ordering::Relaxed);
+}
+
+/// Leave the strip overview, for example when focus changes.
+pub fn close_strip_overview() {
+    STRIP_OVERVIEW.store(false, Ordering::Relaxed);
+}
+
+/// Whether the strip overview is shown.
+pub fn strip_overview_open() -> bool {
+    STRIP_OVERVIEW.load(Ordering::Relaxed)
+}
+
 /// Whether the strip position indicator should be drawn.
 pub fn position_indicator_enabled() -> bool {
     POSITION_INDICATOR_ENABLED.load(Ordering::Relaxed)

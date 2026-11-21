@@ -102,6 +102,41 @@ impl State {
                 self.common.shell.write().center_scrolling_column(seat);
             }
 
+            Action::Private(PrivateAction::Strip(action)) => {
+                let focus = self
+                    .common
+                    .shell
+                    .write()
+                    .scrolling_strip_action(seat, action);
+                if let Some(mapped) = focus {
+                    Shell::set_focus(
+                        self,
+                        Some(&KeyboardFocusTarget::from(mapped)),
+                        seat,
+                        Some(serial),
+                        false,
+                    );
+                }
+                if let Some(output) = seat.focused_output() {
+                    self.backend.schedule_render(&output);
+                }
+            }
+
+            Action::Private(PrivateAction::ToggleScratchLayer) => {
+                let loop_handle = self.common.event_loop_handle.clone();
+                self.common
+                    .shell
+                    .write()
+                    .toggle_scratch_layer(seat, &loop_handle);
+            }
+
+            Action::Private(PrivateAction::ToggleStripOverview) => {
+                crate::backend::render::scrolling_backdrop::toggle_strip_overview();
+                if let Some(output) = seat.focused_output() {
+                    self.backend.schedule_render(&output);
+                }
+            }
+
             Action::Private(PrivateAction::Resizing(direction, edge, state)) => {
                 if state == shortcuts::State::Pressed {
                     self.common
